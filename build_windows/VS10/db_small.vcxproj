@@ -275,6 +275,7 @@
     <ClCompile Include="..\..\src\log\log_compare.c"/>
     <ClCompile Include="..\..\src\log\log_debug.c"/>
     <ClCompile Include="..\..\src\log\log_get.c"/>
+    <ClCompile Include="..\..\src\log\log_handoff_trace.c"/>
     <ClCompile Include="..\..\src\log\log_method.c"/>
     <ClCompile Include="..\..\src\log\log_put.c"/>
     <ClCompile Include="..\..\src\log\log_stat.c"/>
@@ -298,11 +299,16 @@
     <ClCompile Include="..\..\src\mutex\mut_alloc.c"/>
     <ClCompile Include="..\..\src\mutex\mut_failchk.c"/>
     <ClCompile Include="..\..\src\mutex\mut_method.c"/>
+    <ClCompile Include="..\..\src\mutex\mut_order.c"/>
     <ClCompile Include="..\..\src\mutex\mut_region.c"/>
     <ClCompile Include="..\..\src\mutex\mut_stat.c"/>
     <ClCompile Include="..\..\src\mutex\mut_win32.c"/>
     <ClCompile Include="..\..\src\os\os_abort.c"/>
     <ClCompile Include="..\..\src\os\os_alloc.c"/>
+    <ClCompile Include="..\..\src\os\os_atomic.c"/>
+    <ClCompile Include="..\..\src\os\os_aio.c"/>
+    <ClCompile Include="..\..\src\os\os_aio_iocp.c"/>
+    <ClCompile Include="..\..\src\os\os_aio_pool.c"/>
     <ClCompile Include="..\..\src\os\os_ctime.c"/>
     <ClCompile Include="..\..\src\os\os_pid.c"/>
     <ClCompile Include="..\..\src\os\os_root.c"/>
@@ -312,6 +318,7 @@
     <ClCompile Include="..\..\src\os\os_uid.c"/>
     <ClCompile Include="..\..\src\os_windows\os_abs.c"/>
     <ClCompile Include="..\..\src\os_windows\os_clock.c"/>
+    <ClCompile Include="..\..\src\os_windows\os_csprng.c"/>
     <ClCompile Include="..\..\src\os_windows\os_config.c"/>
     <ClCompile Include="..\..\src\os_windows\os_cpu.c"/>
     <ClCompile Include="..\..\src\os_windows\os_dir.c"/>

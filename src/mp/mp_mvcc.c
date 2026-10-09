@@ -283,7 +283,7 @@ __memp_bh_freeze(dbmp, infop, hp, bhp, need_frozenp)
 	    DB_MUTEX_SHARED, &frozen_bhp->mtx_buf)) != 0)
 		goto err;
 	F_SET(frozen_bhp, BH_FROZEN);
-	F_CLR(frozen_bhp, BH_EXCLUSIVE);
+	BH_CLR_EXCLUSIVE(frozen_bhp);
 	((BH_FROZEN_PAGE *)frozen_bhp)->spgno = newpgno;
 
 	/*
@@ -565,7 +565,7 @@ __memp_bh_thaw(dbmp, infop, hp, frozen_bhp, alloc_bhp)
 	 */
 	MUTEX_REQUIRED(env, hp->mtx_hash);
 	if (alloc_bhp != NULL) {
-		alloc_bhp->priority = c_mp->lru_priority;
+		alloc_bhp->priority = MPOOL_CLOCK_DEFAULT;
 
 		SH_CHAIN_INSERT_AFTER(frozen_bhp, alloc_bhp, vc, __bh);
 		if (!SH_CHAIN_HASNEXT(alloc_bhp, vc)) {

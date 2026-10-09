@@ -40,9 +40,15 @@
 #include "db_config.h"
 
 #include "db_int.h"
+#include "dbinc/lock.h"
 #include "dbinc/log.h"
 #include "dbinc/mp.h"
 #include "dbinc/txn.h"
+
+#ifdef HAVE_DST
+#include "sim_inject.h"			/* DST planted-bug harness. */
+#include "sim_buggify.h"			/* DST buggify points. */
+#endif
 
 /*
  * __txn_checkpoint_pp --
@@ -98,6 +104,11 @@ __txn_checkpoint(env, kbytes, minutes, flags)
 {
 	DB_LOG *dblp;
 	DB_LSN ckp_lsn, last_ckp, msg_lsn;
+#if defined(HAVE_DST)
+#if DB_DST_BUG(5)
+	DB_LSN bad_ckp;
+#endif
+#endif
 	DB_TXNMGR *mgr;
 	DB_TXNREGION *region;
 	LOG *lp;
@@ -137,6 +148,14 @@ __txn_checkpoint(env, kbytes, minutes, flags)
 	 */
 	id = renv->envid;
 
+	/*
+	 * SSI: a checkpoint is a convenient, infrequent point at which to
+	 * reclaim SIREAD markers left by committed snapshot-safe readers whose
+	 * snapshots are no longer visible to any active reader.  Best effort.
+	 */
+	if (LOCKING_ON(env))
+		(void)__lock_sicleanup(env);
+
 	MUTEX_LOCK(env, region->mtx_ckp);
 	/*
 	 * The checkpoint LSN is an LSN such that all transactions begun before
@@ -154,6 +173,22 @@ __txn_checkpoint(env, kbytes, minutes, flags)
 		/* Don't checkpoint a quiescent database. */
 		if (bytes == 0 && mbytes == 0)
 			goto err;
+
+#ifdef HAVE_DST
+		/*
+		 * BUGGIFY txn.chkpt_force: take the checkpoint NOW even though
+		 * the kbytes/minutes threshold has not been reached (there IS
+		 * log activity -- the quiescent guard above already bailed if
+		 * not).  Legal-but-pessimal: a more frequent checkpoint is
+		 * always correct (it only advances the recovery start point and
+		 * flushes the cache sooner); it just makes the checkpoint /
+		 * cache-flush / ckp-LSN machinery run far more often than a
+		 * time-or-bytes policy would, stressing checkpoint-vs-workload
+		 * interleavings.
+		 */
+		if (DB_BUGGIFY(BUGGIFY_TXN_CHKPT_FORCE))
+			goto do_ckp;
+#endif
 
 		/*
 		 * If either kbytes or minutes is non-zero, then only take the
@@ -248,6 +283,21 @@ do_ckp:
 	}
 
 	/*
+	 * #138: proactively reclaim obsolete MVCC version buffers now that the
+	 * cache is flushed.  Without this, an obsolete version is freed only
+	 * when __memp_alloc happens to hunt an eviction victim in its bucket;
+	 * a large cache with a wide keyspace never revisits it, so the
+	 * committed snapshot TXN_DETAIL its version pins (and that detail's
+	 * mvcc_mtx slot) is retained without bound.  __memp_purge_obsolete
+	 * frees exactly the versions eviction would free as obsolete, using
+	 * the same visibility frontier, the same BH_OBSOLETE test, and the
+	 * same __txn_remove_buffer free path -- so it can never free a version
+	 * any live reader's snapshot can still see.  Best effort.
+	 */
+	if (MPOOL_ON(env))
+		(void)__memp_purge_obsolete(env);
+
+	/*
 	 * The client won't have more dirty pages to flush from its cache than
 	 * the master did, but there may be differences between the hardware,
 	 * I/O configuration and workload on the master and the client that
@@ -298,8 +348,29 @@ do_ckp:
 		else if (region->stat.st_nrestores == 0)
 			op = DBREG_RCLOSE;
 		if ((ret = __dbreg_log_files(env, op)) != 0 ||
+#if defined(HAVE_DST)
+#if DB_DST_BUG(5)
+		/*
+		 * PLANTED BUG CKPBADLSN (DB_DST_INJECT_BUG=5): write a
+		 * checkpoint record whose recorded ckp_lsn is advanced far
+		 * past the true one.  Recovery reads this record and starts
+		 * its forward pass from the bogus LSN, skipping committed log
+		 * records written after the real checkpoint -- so after a
+		 * crash those committed txns are lost.  test_sim_ckp_lsn's
+		 * "post-checkpoint committed data survives" invariant fires.
+		 * Compiled out of every normal build.
+		 */
+		    (bad_ckp = ckp_lsn, bad_ckp.offset += 100000000,
+		    ret = __txn_ckp_log(env, NULL, &ckp_lsn, logflags,
+		    &bad_ckp, &last_ckp, (int32_t)time(NULL), id, 0)) != 0) {
+#else
 		    (ret = __txn_ckp_log(env, NULL, &ckp_lsn, logflags,
 		    &ckp_lsn, &last_ckp, (int32_t)time(NULL), id, 0)) != 0) {
+#endif
+#else
+		    (ret = __txn_ckp_log(env, NULL, &ckp_lsn, logflags,
+		    &ckp_lsn, &last_ckp, (int32_t)time(NULL), id, 0)) != 0) {
+#endif
 			__db_err(env, ret, DB_STR_A("4520",
 			    "txn_checkpoint: log failed at LSN [%ld %ld]",
 			    "%ld %ld"),

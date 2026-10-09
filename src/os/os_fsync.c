@@ -10,26 +10,8 @@
 
 #include "db_int.h"
 
-#ifdef	HAVE_VXWORKS
-#include "ioLib.h"
-
-#define	fsync(fd)	__vx_fsync(fd)
-
-int
-__vx_fsync(fd)
-	int fd;
-{
-	int ret;
-
-	/*
-	 * The results of ioctl are driver dependent.  Some will return the
-	 * number of bytes sync'ed.  Only if it returns 'ERROR' should we
-	 * flag it.
-	 */
-	if ((ret = ioctl(fd, FIOSYNC, 0)) != ERROR)
-		return (0);
-	return (ret);
-}
+#ifdef HAVE_DST
+#include "sim_os.h"			/* DST I/O hooks (--enable-dst only). */
 #endif
 
 #ifdef __hp3000s900
@@ -100,5 +82,14 @@ __os_fsync(env, fhp)
 		__db_syserr(env, ret, DB_STR("0151", "fsync"));
 		ret = __os_posix_err(ret);
 	}
+#ifdef HAVE_DST
+	/*
+	 * DST write-back cache crash model: a successful fsync promotes this
+	 * file's written extent to durable.  A no-op unless a sim run armed
+	 * the model.  (A single relaxed load in the common case.)
+	 */
+	if (ret == 0)
+		__db_sim_io_sync_hook(fhp);
+#endif
 	return (ret);
 }

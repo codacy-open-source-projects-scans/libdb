@@ -81,9 +81,12 @@ __qam_vrfy_meta(dbp, vdp, meta, pgno, flags)
 
 	/*
 	 * re_len:  If this is bad, we can't safely verify queue data pages, so
-	 * return DB_VERIFY_FATAL
+	 * return DB_VERIFY_FATAL.  rec_page (records per page) must be non-zero:
+	 * it is used as a divisor via QAM_RECNO_PAGE below and throughout the
+	 * queue AM, so a corrupt 0 would divide by zero (SIGFPE).
 	 */
-	if (DB_ALIGN(meta->re_len + sizeof(QAMDATA) - 1, sizeof(u_int32_t)) *
+	if (meta->rec_page == 0 ||
+	    DB_ALIGN(meta->re_len + sizeof(QAMDATA) - 1, sizeof(u_int32_t)) *
 	    meta->rec_page + QPAGE_SZ(dbp) > dbp->pgsize) {
 		EPRINT((env, DB_STR_A("1147",
     "Page %lu: queue record length %lu too high for page size and recs/page",
@@ -436,7 +439,7 @@ __qam_vrfy_walkqueue(dbp, vdp, handle, callback, flags)
 	PAGE *h;
 	QUEUE *qp;
 	VRFY_PAGEINFO *pip;
-	db_pgno_t first, i, last, pg_ext, stop;
+	db_pgno_t first, i, last, maxpage, pg_ext, stop;
 	int isbad, nextents, ret, t_ret;
 
 	COMPQUIET(h, NULL);
@@ -460,6 +463,46 @@ __qam_vrfy_walkqueue(dbp, vdp, handle, callback, flags)
 		stop = QAM_RECNO_PAGE(dbp, UINT32_MAX);
 	else
 		stop = last;
+
+	/*
+	 * A wrapped queue (first > last) sets `stop` to the page holding recno
+	 * UINT32_MAX -- for a small rec_page that is billions of pages, far
+	 * more than any queue can hold.  The loop below steps one page at a time
+	 * (it only skips ahead by an extent when a page is missing), so a
+	 * corrupt or hostile queue meta page turns verification into a
+	 * multi-billion-iteration scan: a denial of service.  It is a bounded
+	 * one -- the scan terminates and corrupts nothing -- but it can occupy
+	 * a verify for hours.
+	 *
+	 * Bound the scan by what the extent files on disk can actually hold.
+	 * Note this must NOT be bounded by vdp->last_pgno: that is the last page
+	 * of the main .db file, and a queue with extents keeps only its meta
+	 * page there (every data page lives in a separate __dbq.<name>.<id>
+	 * file), so last_pgno is 0 and clamping to it skips this loop entirely,
+	 * silently verifying nothing.  __qam_extent_maxpage() reads the data
+	 * directory instead and returns the last page of the highest-numbered
+	 * extent present.
+	 *
+	 * A legitimate queue cannot be truncated by this bound: its pages live
+	 * in extents that exist, so they are <= maxpage.  A missing extent stays
+	 * non-fatal -- consuming unlinks extents and leaves holes, and the
+	 * ENOENT path below still skips ahead rather than failing.  When no
+	 * extent file exists at all (maxpage == PGNO_INVALID) there is nothing
+	 * to walk, so the queue's own first/last remain the only bound.
+	 */
+	if ((ret = __qam_extent_maxpage(dbp, &maxpage)) != 0)
+		return (ret);
+	if (maxpage == PGNO_INVALID)
+		/*
+		 * No extent file exists at all -- a newly created or fully
+		 * consumed queue.  There are no extent pages to walk, so
+		 * scanning to `stop` would probe every page the meta page
+		 * claims: billions for a wrapped queue, one stat(2) apiece.
+		 * #163 skipped the clamp here and so left this case unbounded.
+		 */
+		stop = first;
+	else if (stop > maxpage)
+		stop = maxpage;
 	nextents = vdp->nextents;
 
 	/* Verify/salvage each page. */

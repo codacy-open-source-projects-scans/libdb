@@ -1,0 +1,31 @@
+# RFC index
+
+The register of libdb design proposals. See [`README.md`](README.md) for the
+process. Status: Draft · Accepted · Rejected · Superseded · Implemented.
+
+| # | Title | Status | Type |
+|---|-------|--------|------|
+| [0001](0001-adaptive-lsm.md) | Adaptive LSM access method (HanoiDB + segment-policy, Bitcask, index-in-WAL) | Draft | Prospective |
+| [0002](0002-buffer-swip-aio.md) | Scalable buffer access: tagged swip, optimistic descent, async I/O | Draft | Prospective |
+| [0003](0003-ssi-serializable-snapshot-isolation.md) | Serializable Snapshot Isolation (SSI): `DB_TXN_SERIALIZABLE` flag, rw-antidependency detection (`DB_TXN_SNAPSHOT` remains plain SI) | Implemented | Normative |
+| [0004](0004-funnel-sparse-hash.md) | Funnel-sparse HASH: bounded-probe overflow cascade, sparsehash-dense pages, sparsemap free-space | Draft | Prospective |
+| [0005](0005-row-level-conflict-tracking.md) | Optional row-level (key-level) SSI conflict tracking instead of page-level (false-abort reduction) | **Rejected** | Analysed |
+| [0006](0006-chain-replicated-wal-multi-master.md) | Chain-replicated WAL as a shared log: multi-master, scale-out HA (CORFU/Tango/chain replication; log-order certification reusing SSI) | Draft | Prospective |
+| [0007](0007-optimistic-read-validation.md) | Optimistic read-path page validation, removing the shared pin refcount from reads (LeanStore/OLC adapted to multi-process) | Draft | Prospective |
+| [0008](0008-scalable-wal-append.md) | Scalable WAL append: shrinking `__log_put`'s critical section (P5) — PostgreSQL WAL insertion locks, InnoDB 8.0 `link_buf`, Aether consolidation array | Draft | Analysed |
+| [0009](0009-wal-backpressure.md) | WAL backpressure at the API boundary: bound the append-vs-durable lag and report saturation (RFC 0008 design D3) | Draft | Prospective |
+| [0010](0010-global-invariants.md) | Global invariants across subsystems: the A-series partial orders the lock-order checker encodes, and the G-series gap register | Accepted | Normative |
+| [0011](0011-test-coverage-gaps.md) | Test-coverage gaps that let shipped defects through (G12-G15): scaling shape, configure-option sweep, runtime-flag behaviour | Accepted | Normative |
+| [0012](0012-locker-alloc-scaling.md) | `mtx_locker_stripe[0]`: the locker-allocation latch | Draft |
+| [0013](0013-cross-engine-campaign.md) | Cross-engine benchmark campaign: plan for review | Draft |
+
+<!-- Add a row per RFC. Keep the number 4-digit zero-padded and monotonic. -->
+
+## Cross-subsystem design notes
+
+Normative notes about the composition of already-shipped subsystems (not
+proposals). See [`README.md`](README.md) § "Cross-subsystem design notes".
+
+| Note | Status | Subject |
+|------|--------|---------|
+| [`rfc/0010-global-invariants.md`](../rfc/0010-global-invariants.md) | Normative | Global invariants across the lock manager (+SSI), txn region, mpool/MVCC, WAL, checkpoint, failchk, recovery, rsnap and cursor sharding — at a checkpoint, at a crash, at a region re-attach; the global lock order; the dangerous subsystem pairs; audit coverage and named gaps |

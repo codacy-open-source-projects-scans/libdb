@@ -77,8 +77,14 @@ extern "C" {
 #define	MTX_TXN_COMMIT		36
 #define	MTX_TXN_MVCC		37
 #define	MTX_TXN_REGION		38
+/*
+ * Appended, not inserted in alphabetical order: these IDs are the index
+ * space of the mutex-region allocation statistics, so renumbering the
+ * existing entries would silently relabel every historical stat dump.
+ */
+#define	MTX_MPOOL_AIO		39
 
-#define	MTX_MAX_ENTRY		38
+#define	MTX_MAX_ENTRY		39
 
 /* The following macros are defined on some platforms, e.g. QNX. */
 #undef __mutex_init
@@ -196,6 +202,59 @@ static inline int __db_pthread_mutex_tryreadlock(ENV *env, db_mutex_t mutex)
 #endif
 
 /*
+ * DIAGNOSTIC-only lock-order checking.  Hooked here, at the __mutex_*
+ * redirection layer, rather than at the MUTEX_* macros below, because this is
+ * the single narrowest waist that every acquisition passes through: all five
+ * MUTEX_* macros expand to these, and so do the direct __mutex_* callers in
+ * mut_region.c (the region self-test) and mut_method.c (the public
+ * DB_ENV->mutex_lock).  Hooking the macros instead would have missed those and
+ * would have needed five hook sites instead of two.
+ *
+ * The order is VALIDATED BEFORE the acquisition and RECORDED AFTER it succeeds.
+ * Validating first is not a detail -- it is the whole reason the checker has
+ * teeth.  A self-deadlock (the same non-recursive latch twice on one thread)
+ * never returns from the acquire call, so a checker that only looked after a
+ * successful acquisition would hang in exactly the case it exists to diagnose.
+ * Recording only on success keeps the held-set honest when a trylock fails.
+ *
+ * See src/dbinc/lock_order.h for the order itself.
+ */
+#include "dbinc/lock_order.h"
+
+#ifdef DIAGNOSTIC
+#define	DB_LO_LOCK(fn, env, mutex)					\
+	(__db_lo_check(env, mutex, __FILE__, __LINE__),			\
+	 __db_lo_wrap_acq(env, mutex, fn(env, mutex), __FILE__, __LINE__))
+#define	DB_LO_UNLOCK(fn, env, mutex)					\
+	(__db_lo_release(env, mutex), fn(env, mutex))
+
+/*
+ * An inline helper rather than a statement macro: this sits inside expressions
+ * (MUTEX_TRYLOCK is used as a value), so it must be an expression itself.
+ */
+static inline int
+__db_lo_wrap_acq(ENV *env, db_mutex_t mutex, int ret,
+    const char *file, int line)
+{
+	if (ret == 0)
+		__db_lo_acquire(env, mutex, file, line);
+	return (ret);
+}
+
+#define	__mutex_lock_ck(env, m)		DB_LO_LOCK(__mutex_lock, env, m)
+#define	__mutex_rdlock_ck(env, m)	DB_LO_LOCK(__mutex_rdlock, env, m)
+#define	__mutex_trylock_ck(env, m)	DB_LO_LOCK(__mutex_trylock, env, m)
+#define	__mutex_tryrdlock_ck(env, m)	DB_LO_LOCK(__mutex_tryrdlock, env, m)
+#define	__mutex_unlock_ck(env, m)	DB_LO_UNLOCK(__mutex_unlock, env, m)
+#else
+#define	__mutex_lock_ck(env, m)		__mutex_lock(env, m)
+#define	__mutex_rdlock_ck(env, m)	__mutex_rdlock(env, m)
+#define	__mutex_trylock_ck(env, m)	__mutex_trylock(env, m)
+#define	__mutex_tryrdlock_ck(env, m)	__mutex_tryrdlock(env, m)
+#define	__mutex_unlock_ck(env, m)	__mutex_unlock(env, m)
+#endif
+
+/*
  * Lock/unlock a mutex.  If the mutex was never required, the thread of
  * control can proceed without it.
  *
@@ -206,7 +265,7 @@ static inline int __db_pthread_mutex_tryreadlock(ENV *env, db_mutex_t mutex)
 #ifdef HAVE_MUTEX_SUPPORT
 #define	MUTEX_LOCK(env, mutex) do {					\
 	if ((mutex) != MUTEX_INVALID &&					\
-	    __mutex_lock(env, mutex) != 0)				\
+	    __mutex_lock_ck(env, mutex) != 0)				\
 		return (DB_RUNRECOVERY);				\
 } while (0)
 
@@ -215,22 +274,22 @@ static inline int __db_pthread_mutex_tryreadlock(ENV *env, db_mutex_t mutex)
  * or DB_LOCK_NOTGRANTED, or possibly DB_RUNRECOVERY for failchk.
  */
 #define	MUTEX_TRYLOCK(env, mutex)					\
-	(((mutex) == MUTEX_INVALID) ? 0 : __mutex_trylock(env, mutex))
+	(((mutex) == MUTEX_INVALID) ? 0 : __mutex_trylock_ck(env, mutex))
 
 /*
  * Acquire a DB_MUTEX_SHARED "mutex" in shared mode.
  */
 #define	MUTEX_READLOCK(env, mutex) do {					\
 	if ((mutex) != MUTEX_INVALID &&					\
-	    __mutex_rdlock(env, mutex) != 0)				\
+	    __mutex_rdlock_ck(env, mutex) != 0)				\
 		return (DB_RUNRECOVERY);				\
 } while (0)
 #define	MUTEX_TRY_READLOCK(env, mutex)					\
-	((mutex) != MUTEX_INVALID ? __mutex_tryrdlock(env, mutex) : 0)
+	((mutex) != MUTEX_INVALID ? __mutex_tryrdlock_ck(env, mutex) : 0)
 
 #define	MUTEX_UNLOCK(env, mutex) do {					\
 	if ((mutex) != MUTEX_INVALID &&					\
-	    __mutex_unlock(env, mutex) != 0)				\
+	    __mutex_unlock_ck(env, mutex) != 0)				\
 		return (DB_RUNRECOVERY);				\
 } while (0)
 
@@ -247,11 +306,25 @@ static inline int __db_pthread_mutex_tryreadlock(ENV *env, db_mutex_t mutex)
  * the call with something the compiler can discard, but which will make
  * if-then-else blocks work correctly.
  */
-#define	MUTEX_LOCK(env, mutex)		(mutex) = (mutex)
-#define	MUTEX_TRYLOCK(env, mutex)	(mutex) = (mutex)
-#define	MUTEX_READLOCK(env, mutex)	(mutex) = (mutex)
-#define	MUTEX_TRY_READLOCK(env, mutex)	(mutex) = (mutex)
-#define	MUTEX_UNLOCK(env, mutex)	(mutex) = (mutex)
+/*
+ * Each stub must be usable both as a STATEMENT and as a VALUE.  The original
+ * form was `(mutex) = (mutex)`, which the comment above explains was chosen so
+ * if-then-else blocks still parse -- but it is an assignment expression, so a
+ * caller that tests the result, as the os_aio cross-reap latch does with
+ *
+ *	MUTEX_TRYLOCK(env, dbmp->aio_ctx->mtx_aio) == 0
+ *
+ * fails with "lvalue required as left operand of assignment" whenever the
+ * argument is not a bare lvalue.  Casting to void and yielding 0 keeps the
+ * statement use working, makes the value use compile, and returns the success
+ * code the trylock/readlock contract specifies (0 == acquired), which is the
+ * right answer when there is no mutex to contend for.
+ */
+#define	MUTEX_LOCK(env, mutex)		((void)(mutex), 0)
+#define	MUTEX_TRYLOCK(env, mutex)	((void)(mutex), 0)
+#define	MUTEX_READLOCK(env, mutex)	((void)(mutex), 0)
+#define	MUTEX_TRY_READLOCK(env, mutex)	((void)(mutex), 0)
+#define	MUTEX_UNLOCK(env, mutex)	((void)(mutex), 0)
 #define	MUTEX_REQUIRED(env, mutex)	(mutex) = (mutex)
 #define	MUTEX_REQUIRED_READ(env, mutex)	(mutex) = (mutex)
 #define	MUTEX_WAIT(env, mutex, duration) (mutex) = (mutex)
@@ -260,32 +333,6 @@ static inline int __db_pthread_mutex_tryreadlock(ENV *env, db_mutex_t mutex)
 /*
  * Berkeley DB ports may require single-threading at places in the code.
  */
-#ifdef HAVE_MUTEX_VXWORKS
-#include "taskLib.h"
-/*
- * Use the taskLock() mutex to eliminate a race where two tasks are
- * trying to initialize the global lock at the same time.
- */
-#define	DB_BEGIN_SINGLE_THREAD do {					\
-	if (DB_GLOBAL(db_global_init))					\
-		(void)semTake(DB_GLOBAL(db_global_lock), WAIT_FOREVER);	\
-	else {								\
-		taskLock();						\
-		if (DB_GLOBAL(db_global_init)) {			\
-			taskUnlock();					\
-			(void)semTake(DB_GLOBAL(db_global_lock),	\
-			    WAIT_FOREVER);				\
-			continue;					\
-		}							\
-		DB_GLOBAL(db_global_lock) =				\
-		    semBCreate(SEM_Q_FIFO, SEM_EMPTY);			\
-		if (DB_GLOBAL(db_global_lock) != NULL)			\
-			DB_GLOBAL(db_global_init) = 1;			\
-		taskUnlock();						\
-	}								\
-} while (DB_GLOBAL(db_global_init) == 0)
-#define	DB_END_SINGLE_THREAD	(void)semGive(DB_GLOBAL(db_global_lock))
-#endif
 
 /*
  * Single-threading defaults to a no-op.

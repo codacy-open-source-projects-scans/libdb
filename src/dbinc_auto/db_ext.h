@@ -30,6 +30,8 @@ int __db_backup_name __P((ENV *, const char *, DB_TXN *, char **));
 int __db_testcopy __P((ENV *, DB *, const char *));
 #endif
 int __db_testdocopy __P((ENV *, const char *));
+u_int32_t __db_cursor_part __P((DB *));
+int __db_cq_active_any __P((DB *));
 int __db_cursor_int __P((DB *, DB_THREAD_INFO *, DB_TXN *, DBTYPE, db_pgno_t, int, DB_LOCKER *, DBC **));
 int __db_put __P((DB *, DB_THREAD_INFO *, DB_TXN *, DBT *, DBT *, u_int32_t));
 int __db_del __P((DB *, DB_THREAD_INFO *, DB_TXN *, DBT *, u_int32_t));
@@ -212,8 +214,6 @@ const FN * __db_get_flags_fn __P((void));
 int __db_prnpage __P((DB *, DB_TXN *, db_pgno_t));
 int __db_prpage __P((DB *, PAGE *, u_int32_t));
 const char * __db_lockmode_to_string __P((db_lockmode_t));
-int __db_dumptree __P((DB *, DB_TXN *, char *, char *, db_pgno_t, db_pgno_t));
-const FN * __db_get_flags_fn __P((void));
 int __db_prpage_int __P((ENV *, DB_MSGBUF *, DB *, char *, PAGE *, u_int32_t, u_int8_t *, u_int32_t));
 void __db_prbytes __P((ENV *, DB_MSGBUF *, u_int8_t *, u_int32_t));
 void __db_prflags __P((ENV *, DB_MSGBUF *, u_int32_t, const FN *, const char *, const char *));
@@ -332,13 +332,6 @@ int __part_rename __P((DB *, DB_THREAD_INFO *, DB_TXN *, const char *, const cha
 int __part_verify __P((DB *, VRFY_DBINFO *, const char *, void *, int (*)(void *, const void *), u_int32_t));
 int __part_testdocopy __P((DB *, const char *));
 int __db_no_partition __P((ENV *));
-int __partition_set __P((DB *, u_int32_t, DBT *, u_int32_t (*callback)(DB *, DBT *key)));
-int __partition_get_callback __P((DB *, u_int32_t *, u_int32_t (**callback)(DB *, DBT *key)));
-int __partition_get_dirs __P((DB *, const char ***));
-int __partition_get_keys __P((DB *, u_int32_t *, DBT **));
-int __partition_init __P((DB *, u_int32_t));
-int __part_fileid_reset __P((ENV *, DB_THREAD_INFO *, const char *, u_int32_t, int));
-int __partition_set_dirs __P((DB *, const char **));
 
 #if defined(__cplusplus)
 }

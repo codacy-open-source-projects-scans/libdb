@@ -18,6 +18,15 @@
 #include "dbinc/mutex_int.h"
 
 /*
+ * The shared-latch path casts the address of an atomic sharecount to the
+ * pointer type the Interlocked* intrinsics expect (LONG volatile *).  The
+ * cast type `interlocked_val` was referenced but never defined upstream.
+ */
+#ifndef interlocked_val
+#define	interlocked_val		long volatile *
+#endif
+
+/*
  * Common code to get an event handle.  This is executed whenever a mutex
  * blocks, or when unlocking a mutex that a thread is waiting on.  We can't
  * keep these handles around, since the mutex structure is in shared memory,
@@ -42,7 +51,6 @@ static __inline int get_handle(env, mutexp, eventp)
 	for (id = (mutexp)->id; id != 0; id >>= 4)
 		*--p = hex_digits[id & 0xf];
 
-#ifndef DB_WINCE
 	if (DB_GLOBAL(win_sec_attr) == NULL) {
 		InitializeSecurityDescriptor(&DB_GLOBAL(win_default_sec_desc),
 		    SECURITY_DESCRIPTOR_REVISION);
@@ -55,7 +63,6 @@ static __inline int get_handle(env, mutexp, eventp)
 		    &DB_GLOBAL(win_default_sec_desc);
 		DB_GLOBAL(win_sec_attr) = &DB_GLOBAL(win_default_sec_attr);
 	}
-#endif
 
 	if ((*eventp = CreateEvent(DB_GLOBAL(win_sec_attr),
 	    FALSE, FALSE, idbuf)) == NULL) {
@@ -110,13 +117,6 @@ __db_win32_mutex_lock_int(env, mutex, timeout, wait)
 		timespecclear(&timeoutspec);
 		__clock_set_expires(env, &timeoutspec, timeout);
 	}
-
-	/*
-	 * See WINCE_ATOMIC_MAGIC definition for details.
-	 * Use sharecount, because the value just needs to be a db_atomic_t
-	 * memory mapped onto the same page as those being Interlocked*.
-	 */
-	WINCE_ATOMIC_MAGIC(&mutexp->sharecount);
 
 	event = NULL;
 	ms = 50;
@@ -332,13 +332,6 @@ __db_win32_mutex_readlock_int(env, mutex, nowait)
 
 	CHECK_MTX_THREAD(env, mutexp);
 
-	/*
-	 * See WINCE_ATOMIC_MAGIC definition for details.
-	 * Use sharecount, because the value just needs to be a db_atomic_t
-	 * memory mapped onto the same page as those being Interlocked*.
-	 */
-	WINCE_ATOMIC_MAGIC(&mutexp->sharecount);
-
 	event = NULL;
 	ms = 50;
 	ret = 0;
@@ -513,14 +506,13 @@ __db_win32_mutex_unlock(env, mutex)
 		if (F_ISSET(mutexp, DB_MUTEX_LOCKED)) {
 			F_CLR(mutexp, DB_MUTEX_LOCKED);
 			if ((ret = InterlockedExchange(
-			    (interlocked_val)(&atomic_read(
-			    &mutexp->sharecount)), 0)) !=
+			    (interlocked_val)(&mutexp->sharecount.value), 0)) !=
 			    MUTEX_SHARE_ISEXCLUSIVE) {
 				ret = DB_RUNRECOVERY;
 				goto err;
 			}
 		} else if (InterlockedDecrement(
-		    (interlocked_val)(&atomic_read(&mutexp->sharecount))) > 0)
+		    (interlocked_val)(&mutexp->sharecount.value)) > 0)
 			return (0);
 	} else
 #endif
@@ -568,14 +560,13 @@ __db_win32_mutex_destroy(env, mutex)
 	return (0);
 }
 
-#ifndef DB_WINCE
 /*
  * db_env_set_win_security
  *
  *	Set the SECURITY_ATTRIBUTES to be used by BDB on Windows.
  *	It should not be called while any BDB mutexes are locked.
  *
- * EXTERN: #if defined(DB_WIN32) && !defined(DB_WINCE)
+ * EXTERN: #if defined(DB_WIN32)
  * EXTERN: int db_env_set_win_security __P((SECURITY_ATTRIBUTES *sa));
  * EXTERN: #endif
  */
@@ -586,4 +577,3 @@ db_env_set_win_security(sa)
 	DB_GLOBAL(win_sec_attr) = sa;
 	return (0);
 }
-#endif

@@ -30,6 +30,18 @@
 /* Define to 1 if you have the 'abort' function. */
 #undef HAVE_ABORT
 
+/* Define to 1 to use the BSD kqueue+aio backend. */
+#undef HAVE_AIO_KQUEUE
+
+/* Define to 1 to use the POSIX aio backend. */
+#undef HAVE_AIO_POSIX
+
+/* Define to 1 to use the thread-pool AIO offload backend. */
+#undef HAVE_AIO_THREADPOOL
+
+/* Define to 1 if you have the 'arc4random_buf' function. */
+#undef HAVE_ARC4RANDOM_BUF
+
 /* Define to 1 if you have the 'atoi' function. */
 #undef HAVE_ATOI
 
@@ -54,6 +66,9 @@
 
 /* Define to 1 to use GCC __atomic_* builtins for atomic operations. */
 #undef HAVE_ATOMIC_BUILTINS
+
+/* Define to 1 when the GCC/Clang __atomic_* builtin tier is selected. */
+#undef HAVE_ATOMIC_GCC_BUILTIN
 
 /* Define to 1 to use Solaris library routes for atomic operations. */
 #undef HAVE_ATOMIC_SOLARIS
@@ -108,6 +123,9 @@
 /* Define to 1 if you have the <dlfcn.h> header file. */
 #undef HAVE_DLFCN_H
 
+/* Define to 1 to build with Deterministic Simulation Testing hooks. */
+#undef HAVE_DST
+
 /* Define to 1 to use dtrace for performance monitoring. */
 #undef HAVE_DTRACE
 
@@ -116,6 +134,9 @@
 
 /* Define to 1 if platform has EXIT_SUCCESS/EXIT_FAILURE #defines. */
 #undef HAVE_EXIT_SUCCESS
+
+/* Define to 1 to build with SQLite-style malloc-failure injection hooks. */
+#undef HAVE_FAULT_INJECT
 
 /* Define to 1 if you have the 'fchmod' function. */
 #undef HAVE_FCHMOD
@@ -168,6 +189,9 @@
 /* Define to 1 if getopt supports the optreset variable. */
 #undef HAVE_GETOPT_OPTRESET
 
+/* Define to 1 if you have the 'getrandom' function. */
+#undef HAVE_GETRANDOM
+
 /* Define to 1 if you have the 'getrusage' function. */
 #undef HAVE_GETRUSAGE
 
@@ -176,6 +200,9 @@
 
 /* Define to 1 if you have the 'getuid' function. */
 #undef HAVE_GETUID
+
+/* Define to 1 to instrument the group-commit handoff in __log_flush_int. */
+#undef HAVE_HANDOFF_TRACE
 
 /* Define to 1 if building Hash access method. */
 #undef HAVE_HASH
@@ -188,6 +215,9 @@
 
 /* Define to 1 if you have the <inttypes.h> header file. */
 #undef HAVE_INTTYPES_H
+
+/* Define to 1 to use the Linux io_uring AIO backend. */
+#undef HAVE_IO_URING
 
 /* Define to 1 if you have the 'isalpha' function. */
 #undef HAVE_ISALPHA
@@ -337,9 +367,6 @@
 
 /* Define to 1 to use VMS mutexes. */
 #undef HAVE_MUTEX_VMS
-
-/* Define to 1 to use VxWorks mutexes. */
-#undef HAVE_MUTEX_VXWORKS
 
 /* Define to 1 to use the MSVC compiler and Windows mutexes. */
 #undef HAVE_MUTEX_WIN32
@@ -531,6 +558,9 @@
    */
 #undef HAVE_SYS_NDIR_H
 
+/* Define to 1 if you have the <sys/random.h> header file. */
+#undef HAVE_SYS_RANDOM_H
+
 /* Define to 1 if you have the <sys/sdt.h> header file. */
 #undef HAVE_SYS_SDT_H
 
@@ -569,9 +599,6 @@
 
 /* Define to 1 if you have the 'vsnprintf' function. */
 #undef HAVE_VSNPRINTF
-
-/* Define to 1 if building on VxWorks. */
-#undef HAVE_VXWORKS
 
 /* Define to 1 if you have the 'yield' function. */
 #undef HAVE_YIELD

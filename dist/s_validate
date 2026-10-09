@@ -31,7 +31,7 @@ done
 
 # The set of full tests are those that have special env setup requirements
 # or take a long time to run. They should be run at release time.
-FULL_TESTS="s_chk_build_configs s_chk_vxworks"
+FULL_TESTS="s_chk_build_configs"
 EXCLUDE_TESTS="s_chk_logverify s_chk_srcfiles s_chk_java_samples"
 
 # Run all s_chk scripts, files with extensions are used by the script with
@@ -60,10 +60,21 @@ do
 	fi
 
 	echo "=== Running $t ==="
+	# Honor each checker's shebang instead of forcing `sh`.  Several of them are
+	# bash scripts (arithmetic-for loops); `sh $t` overrode that, so on a system
+	# where /bin/sh is dash they died partway having validated nothing while still
+	# appearing to run -- s_chk_message_id was silently checking ZERO ids, which is
+	# a large part of why five duplicate message ids reached a release.  The
+	# checkers are mode 644 by upstream convention, so pick the interpreter from
+	# the shebang rather than requiring an exec bit.
+	_shell=sh
+	case `head -1 validate/$t` in
+	*bash*)	_shell=bash ;;
+	esac
 	if [ "$verbose" = 1 ]; then
-		(cd validate && sh $t)
+		(cd validate && $_shell $t)
 	else
-		(cd validate && sh $t > /dev/null)
+		(cd validate && $_shell $t > /dev/null)
 	fi
 	ret_val=$?
 	if [ "$ret_val" != 0 ]; then

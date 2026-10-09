@@ -1,0 +1,90 @@
+{
+  description = "Berkeley DB (libdb) — historical archive and living fork";
+
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    flake-utils.url = "github:numtide/flake-utils";
+  };
+
+  outputs = { self, nixpkgs, flake-utils }:
+    flake-utils.lib.eachDefaultSystem (system:
+      let
+        pkgs = import nixpkgs { inherit system; };
+        version = "5.3.34";
+      in {
+        packages = rec {
+          # Default: the Meson/Ninja build of the core C library.
+          libdb-meson = pkgs.stdenv.mkDerivation {
+            pname = "libdb";
+            inherit version;
+            src = ./.;
+            nativeBuildInputs = [ pkgs.meson pkgs.ninja pkgs.python3 pkgs.pkg-config ];
+              # liburing was missing here while the autoconf package below has
+              # it, so the DEFAULT package silently built without the io_uring
+              # backend. That asymmetry went unnoticed because detection used
+              # to fall back quietly to synchronous I/O.
+              #
+              # It stopped being quiet once `uring' became a meson feature
+              # option: nixpkgs' meson setup-hook passes
+              # -Dauto_features=enabled by default, which promotes every 'auto'
+              # feature to a HARD requirement, so the missing library became a
+              # configure error instead of a silent downgrade. Adding the input
+              # is the right fix rather than pinning -During=disabled: this
+              # package should have had the backend all along.
+              buildInputs = pkgs.lib.optionals pkgs.stdenv.isLinux [
+                pkgs.liburing  # io_uring AIO backend (HAVE_IO_URING)
+              ];
+            # A thin meson.build at the repo root drives dist/meson.build; nix's
+            # meson hooks find the root meson.build unchanged.
+          };
+
+          # The reference Autoconf build (build_unix), full feature set.
+          libdb-autoconf = pkgs.stdenv.mkDerivation {
+            pname = "libdb-autoconf";
+            inherit version;
+            src = ./.;
+            enableParallelBuilding = true;
+            buildInputs = pkgs.lib.optionals pkgs.stdenv.isLinux [
+              pkgs.liburing  # io_uring AIO backend
+            ];
+            configurePhase = ''
+              runHook preConfigure
+              cd build_unix
+              ../dist/configure --prefix=$out --enable-shared --disable-static
+              runHook postConfigure
+            '';
+            # buildPhase / installPhase use the default make in build_unix.
+          };
+
+          default = libdb-meson;
+        };
+
+        devShells.default = pkgs.mkShell {
+          packages = [
+            pkgs.meson pkgs.ninja pkgs.python3 pkgs.pkg-config
+            pkgs.gcc pkgs.clang pkgs.autoconf pkgs.gnumake
+            pkgs.bear  # compile_commands.json for clangd (Autoconf build: `make compdb`)
+            pkgs.tcl   # for the TCL test harness (--enable-test)
+            pkgs.cbmc  # bounded model checker for the formal-verification harnesses (test/cbmc)
+            pkgs.pandoc  # docs pipeline: html->md extraction + md->html/pdf/man (docs_src/build.py)
+            pkgs.jdk     # javadoc: Java API reference (build_java_api in docs_src/build.py)
+            # Docs validation toolchain (docs_src/build.py + .github/workflows/docs.yml):
+            pkgs.python3Packages.weasyprint  # HTML->PDF (build_pdf; no TeX needed)
+            pkgs.poppler-utils               # pdfinfo/pdftotext: PDF page-count + title check
+            pkgs.mandoc                      # man -Tlint (0 ERRORS gate)
+            pkgs.codespell                   # spelling gate (docs_src/_migrate/spellcheck.py)
+            pkgs.lychee                      # internal link-check gate
+            pkgs.write-good                  # prose advisory (passive voice / wordiness)
+          ] ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
+            pkgs.liburing  # Linux io_uring AIO backend (HAVE_IO_URING)
+          ];
+          shellHook = ''
+            echo "libdb dev shell — Meson: 'meson setup build && ninja -C build'"
+            echo "                  Autoconf: 'cd build_unix && ../dist/configure && make'"
+          '';
+        };
+
+        # `nix flake check` smoke: the default package builds.
+        checks.default = self.packages.${system}.default;
+      });
+}

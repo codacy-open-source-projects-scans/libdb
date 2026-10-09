@@ -182,6 +182,7 @@ public class EnvironmentConfig implements Cloneable {
     private boolean txnNoWait = false;
     private boolean txnNotDurable = false;
     private boolean txnSnapshot = false;
+    private boolean txnSerializable = false;
     private boolean txnWriteNoSync = false;
     private boolean yieldCPU = false;
 
@@ -3683,6 +3684,40 @@ True if the handle is configured to run all transactions at snapshot
     }
 
     /**
+    Configure the database environment to run transactions at serializable
+    snapshot isolation (SSI) by default.  See
+    {@link TransactionConfig#setSerializable} for more information.
+    <p>
+    This is the environment-wide default: a transaction that names neither
+    isolation level, and has no parent to inherit one from, runs at SSI.
+    Because SSI implies the snapshot substrate, setting this also gives those
+    transactions snapshot reads.
+    <p>
+    This method may be called at any time during the life of the application.
+
+    @param txnSerializable
+    If true, configure the system to default to serializable snapshot
+    isolation.
+    */
+    public void setTxnSerializable(final boolean txnSerializable) {
+        this.txnSerializable = txnSerializable;
+    }
+
+    /**
+Return true if the handle is configured to run all transactions at
+serializable snapshot isolation (SSI).
+<p>
+This method may be called at any time during the life of the application.
+<p>
+@return
+True if the handle is configured to run all transactions at serializable
+snapshot isolation.
+    */
+    public boolean getTxnSerializable() {
+        return txnSerializable;
+    }
+
+    /**
     Configure the database environment to support at least txnMaxActive
     active transactions.
     <p>
@@ -4408,6 +4443,11 @@ True if the system has been configured to yield the processor
         if (!txnSnapshot && oldConfig.txnSnapshot)
             offFlags |= DbConstants.DB_TXN_SNAPSHOT;
 
+        if (txnSerializable && !oldConfig.txnSerializable)
+            onFlags |= DbConstants.DB_TXN_SERIALIZABLE;
+        if (!txnSerializable && oldConfig.txnSerializable)
+            offFlags |= DbConstants.DB_TXN_SERIALIZABLE;
+
         if (txnWriteNoSync && !oldConfig.txnWriteNoSync)
             onFlags |= DbConstants.DB_TXN_WRITE_NOSYNC;
         if (!txnWriteNoSync && oldConfig.txnWriteNoSync)
@@ -4489,6 +4529,28 @@ True if the system has been configured to yield the processor
         /* Callbacks */
         if (backupHandler != oldConfig.backupHandler)
             dbenv.set_backup_callbacks(backupHandler, backupHandler, backupHandler);
+
+        /*
+         * The four backup tunables.  These accessors existed but were
+         * WRITE-ONLY: setBackupReadCount and friends stored to a private field
+         * and nothing ever pushed the value into the library, so calling them
+         * had no effect at all (defect U8).  DB_ENV->set_backup_config allocates
+         * the backup handle itself (__env_backup_alloc in src/env/env_backup.c),
+         * so unlike the getter these do not require a BackupHandler to have been
+         * installed first, and they can be applied in the ordinary diff style.
+         */
+        if (backup_read_count != oldConfig.backup_read_count)
+            dbenv.set_backup_config(
+                DbConstants.DB_BACKUP_READ_COUNT, backup_read_count);
+        if (backup_read_sleep != oldConfig.backup_read_sleep)
+            dbenv.set_backup_config(
+                DbConstants.DB_BACKUP_READ_SLEEP, backup_read_sleep);
+        if (backup_size != oldConfig.backup_size)
+            dbenv.set_backup_config(
+                DbConstants.DB_BACKUP_SIZE, backup_size);
+        if (backup_write_direct != oldConfig.backup_write_direct)
+            dbenv.set_backup_config(DbConstants.DB_BACKUP_WRITE_DIRECT,
+                backup_write_direct ? 1 : 0);
         if (feedbackHandler != oldConfig.feedbackHandler)
             dbenv.set_feedback(feedbackHandler);
         if (logRecordHandler != oldConfig.logRecordHandler)
@@ -4700,6 +4762,7 @@ True if the system has been configured to yield the processor
         txnNoWait = ((envFlags & DbConstants.DB_TXN_NOWAIT) != 0);
         txnNotDurable = ((envFlags & DbConstants.DB_TXN_NOT_DURABLE) != 0);
         txnSnapshot = ((envFlags & DbConstants.DB_TXN_SNAPSHOT) != 0);
+        txnSerializable = ((envFlags & DbConstants.DB_TXN_SERIALIZABLE) != 0);
         txnWriteNoSync = ((envFlags & DbConstants.DB_TXN_WRITE_NOSYNC) != 0);
         yieldCPU = ((envFlags & DbConstants.DB_YIELDCPU) != 0);
 
@@ -4739,6 +4802,23 @@ True if the system has been configured to yield the processor
         messageHandler = dbenv.get_msgcall();
         panicHandler = dbenv.get_paniccall();
         backupHandler = dbenv.get_backup_handler();
+        /*
+         * The backup tunables read back only when a backup handle exists --
+         * DB_ENV->get_backup_config returns EINVAL when it does not (unlike the
+         * setter, which allocates one).  A handle is present exactly when a
+         * BackupHandler has been installed, so key off that rather than
+         * swallowing an exception.
+         */
+        if (backupHandler != null) {
+            backup_read_count =
+                dbenv.get_backup_config(DbConstants.DB_BACKUP_READ_COUNT);
+            backup_read_sleep =
+                dbenv.get_backup_config(DbConstants.DB_BACKUP_READ_SLEEP);
+            backup_size =
+                dbenv.get_backup_config(DbConstants.DB_BACKUP_SIZE);
+            backup_write_direct = dbenv.get_backup_config(
+                DbConstants.DB_BACKUP_WRITE_DIRECT) != 0;
+        }
         // XXX: replicationTransport and envid aren't available?
 
         /* Other settings */

@@ -12,6 +12,10 @@
 #include "dbinc/mp.h"
 #include "dbinc/txn.h"
 
+#ifdef HAVE_DST
+#include "sim_buggify.h"		/* DST buggify points (--enable-dst only). */
+#endif
+
 /*
  * This configuration parameter limits the number of hash buckets which
  * __memp_alloc() searches through while excluding buffers with a 'high'
@@ -45,9 +49,9 @@ __memp_alloc(dbmp, infop, mfp, len, offsetp, retp)
 	MPOOL *c_mp;
 	MPOOLFILE *bh_mfp;
 	size_t freed_space;
-	u_int32_t buckets, bucket_priority, buffers, cache_reduction;
+	u_int32_t buckets, bucket_priority, buffers;
 	u_int32_t dirty_eviction, high_priority, priority, versions;
-	u_int32_t priority_saved, put_counter, lru_generation, total_buckets;
+	u_int32_t priority_saved, put_counter, total_buckets;
 	int aggressive, alloc_freeze, b_lock, giveup;
 	int h_locked, need_free, obsolete, ret, write_error;
 	u_int8_t *endp;
@@ -63,6 +67,23 @@ __memp_alloc(dbmp, infop, mfp, len, offsetp, retp)
 
 	buckets = buffers = put_counter = total_buckets = versions = 0;
 	aggressive = alloc_freeze = giveup = h_locked = 0;
+
+#ifdef HAVE_DST
+	/*
+	 * BUGGIFY mp.alloc_aggressive: start the buffer-pool scan in
+	 * AGGRESSIVE mode instead of ramping into it only after a full
+	 * sweep frees nothing.  Aggressive means "consider buffers of any
+	 * warmth, one per bucket" -- a strict SUPERSET of the normal
+	 * second-chance scan, so it still only ever evicts a legally
+	 * evictable buffer; it just picks victims more eagerly, stressing
+	 * the write-back / re-read path that a lazy cache rarely exercises.
+	 * aggressive==1 is the mildest level (its switch arm is a plain
+	 * break), so no sync/yield is forced here -- purely a scan-policy
+	 * change, never a correctness change.
+	 */
+	if (DB_BUGGIFY(BUGGIFY_MP_ALLOC_AGGRESSIVE))
+		aggressive = 1;
+#endif
 
 	/*
 	 * If we're allocating a buffer, and the one we're discarding is the
@@ -149,13 +170,12 @@ found:		if (offsetp != NULL)
 
 search:
 	/*
-	 * Anything newer than 1/10th of the buffer pool is ignored during the
-	 * first MPOOL_SEARCH_ALLOC_LIMIT buckets worth of allocation.
+	 * CLOCK replacement: consider buffers of any warmth.  The hash-bucket
+	 * scan below ages (decrements) each unreferenced singleton it passes and
+	 * frees one whose warmth has reached 0 (second chance); when aggressive,
+	 * it frees the coldest buffer it can find regardless of warmth.
 	 */
-	cache_reduction = c_mp->pages / 10;
-	high_priority = aggressive ? MPOOL_LRU_MAX :
-	    c_mp->lru_priority - cache_reduction;
-	lru_generation = c_mp->lru_generation;
+	high_priority = MPOOL_CLOCK_MAX + 1;
 
 	ret = 0;
 	MAX_LSN(oldest_reader);
@@ -224,11 +244,11 @@ search:
 
 			aggressive++;
 			/*
-			 * Once aggressive, we consider all buffers. By setting
-			 * this to MPOOL_LRU_MAX, we'll still select a victim
-			 * even if all buffers have the highest normal priority.
+			 * Once aggressive, we consider all buffers. Setting the
+			 * ceiling above MPOOL_CLOCK_MAX lets us still select a
+			 * victim even if every buffer is at maximum warmth.
 			 */
-			high_priority = MPOOL_LRU_MAX;
+			high_priority = MPOOL_CLOCK_MAX + 1;
 			PERFMON4(env, mpool, alloc_wrap,
 			    len, infop->id, aggressive, c_mp->put_counter);
 			switch (aggressive) {
@@ -270,7 +290,7 @@ search:
 		if (aggressive == 0 && buckets >= MPOOL_ALLOC_SEARCH_LIMIT) {
 			aggressive = 1;
 			/* Once aggressive, we consider all buffers. */
-			high_priority = MPOOL_LRU_MAX;
+			high_priority = MPOOL_CLOCK_MAX + 1;
 		}
 
 		/* Unlock the region and lock the hash bucket. */
@@ -291,7 +311,7 @@ search:
 		 * don't want to free a buffer out of the middle of an MVCC
 		 * chain, since that requires I/O.  So, walk the buffers,
 		 * looking for an obsolete buffer at the end of an MVCC chain.
-		 * Once a buffer becomes obsolete, its LRU priority is
+		 * Once a buffer becomes obsolete, its warmth is
 		 * irrelevant because that version can never be accessed again.
 		 *
 		 * If we don't find any obsolete MVCC buffers, we will get
@@ -311,18 +331,40 @@ retry_search:	bhp = NULL;
 			 * aggressive), and is better than the best candidate
 			 * we have found so far in this bucket.
 			 */
-#ifdef MPOOL_ALLOC_SEARCH_DYN
-			if (aggressive == 0 &&
-			     ++high_priority >= c_mp->lru_priority)
-				aggressive = 1;
-#endif
-
 			if (SH_CHAIN_SINGLETON(current_bhp, vc)) {
-				if (BH_REFCOUNT(current_bhp) != 0)
+				u_int32_t warmth;
+
+				if (BH_REFCOUNT(current_bhp) != 0 ||
+				    current_bhp->wired)
 					continue;
 				buffers++;
-				if (bucket_priority > current_bhp->priority) {
-					bucket_priority = current_bhp->priority;
+				warmth = current_bhp->priority;
+				/*
+				 * COOL-first, scan-resistant selection.  In the
+				 * normal (non-aggressive) sweep we only touch the
+				 * COOL band: a HOT-band buffer is protected (not
+				 * aged, not selected), a COOL buffer above 0 is
+				 * aged one step (second chance), and a buffer at
+				 * warmth 0 is the victim.  A scan keeps supplying
+				 * warmth-0 COOL pages, so the hot working set is
+				 * never aged out from under it.  When aggressive
+				 * (a full sweep found no COOL victim) we consider
+				 * and age every buffer, cooling the hot band too.
+				 * The warmth store races benignly with concurrent
+				 * puts, the same tolerance the old LRU had.
+				 */
+				if (!aggressive) {
+					if (warmth >= MPOOL_CLOCK_HOT)
+						continue;
+					if (warmth != 0) {
+						warmth--;
+						current_bhp->priority = warmth;
+						if (warmth != 0)
+							continue;
+					}
+				}
+				if (bucket_priority > warmth) {
+					bucket_priority = warmth;
 					if (bhp != NULL)
 						atomic_dec(env, &bhp->ref);
 					bhp = current_bhp;
@@ -340,11 +382,6 @@ retry_search:	bhp = NULL;
 			    mvcc_bhp != NULL;
 			    oldest_bhp = mvcc_bhp,
 			    mvcc_bhp = SH_CHAIN_PREV(mvcc_bhp, vc, __bh)) {
-#ifdef MPOOL_ALLOC_SEARCH_DYN
-				if (aggressive == 0 &&
-				     ++high_priority >= c_mp->lru_priority)
-					aggressive = 1;
-#endif
 				DB_ASSERT(env, mvcc_bhp !=
 				    SH_CHAIN_PREV(mvcc_bhp, vc, __bh));
 				if ((aggressive < 2 &&
@@ -458,19 +495,9 @@ retry_search:	bhp = NULL;
 		}
 
 		/*
-		 * If another thread has called __memp_reset_lru() while we were
-		 * looking for this buffer, it is possible that we've picked a
-		 * poor choice for a victim. If so toss it and start over.
+		 * Discard any previously remembered hash bucket, we've got
+		 * a winner.
 		 */
-		if (lru_generation != c_mp->lru_generation) {
-			DB_ASSERT(env, BH_REFCOUNT(bhp) > 0);
-			atomic_dec(env, &bhp->ref);
-			MUTEX_UNLOCK(env, hp->mtx_hash);
-			MPOOL_REGION_LOCK(env, infop);
-			hp_saved = NULL;
-			goto search;
-		}
-
 this_buffer:	/*
 		 * Discard any previously remembered hash bucket, we've got
 		 * a winner.
@@ -491,11 +518,27 @@ this_buffer:	/*
 				return (ret);
 			goto next_hb;
 		}
-		F_SET(bhp, BH_EXCLUSIVE);
+		BH_SET_EXCLUSIVE(bhp);
 		b_lock = 1;
 
 		/* Someone may have grabbed it while we got the lock. */
 		if (BH_REFCOUNT(bhp) != 1)
+			goto next_hb;
+
+		/*
+		 * RFC 0007 phase 1: an optimistic reader holds no ref, so
+		 * BH_REFCOUNT above does not see it.  Its per-thread pin record
+		 * does.  BH_SET_EXCLUSIVE above already bumped the generation
+		 * and marked the frame in flux, and it did so with a fence, so
+		 * the order is: bump, then scan.  A reader that publishes its
+		 * pin before the bump is seen here; one that publishes after
+		 * the bump fails validation.  Neither can slip through.
+		 *
+		 * O(threads) and off the hot path, but eviction is not rare
+		 * under memory pressure -- see the measurement in
+		 * test/bench/OPTIMISTIC-READS-2026-09.md.
+		 */
+		if (__memp_bh_pinned(env, infop, bhp))
 			goto next_hb;
 
 		/* Find the associated MPOOLFILE. */
@@ -505,7 +548,7 @@ this_buffer:	/*
 		ret = 0;
 		dirty_eviction = 0;
 		if (F_ISSET(bhp, BH_DIRTY)) {
-			DB_ASSERT(env, atomic_read(&hp->hash_page_dirty) > 0);
+			DB_ASSERT(env, atomic_read_relaxed(&hp->hash_page_dirty) > 0);
 			ret = __memp_bhwrite(dbmp, hp, bh_mfp, bhp, 0);
 			DB_ASSERT(env, atomic_read(&bhp->ref) > 0);
 
@@ -525,7 +568,7 @@ this_buffer:	/*
 					    __memp_fns(dbmp, bh_mfp),
 					    bhp->pgno, ret);
 				}
-				bhp->priority = MPOOL_LRU_REDZONE;
+				bhp->priority = MPOOL_CLOCK_MAX;
 
 				goto next_hb;
 			}
@@ -554,7 +597,7 @@ this_buffer:	/*
 				DB_ASSERT(env, BH_REFCOUNT(bhp) > 0);
 				atomic_dec(env, &bhp->ref);
 				DB_ASSERT(env, b_lock);
-				F_CLR(bhp, BH_EXCLUSIVE);
+				BH_CLR_EXCLUSIVE(bhp);
 				MUTEX_UNLOCK(env, bhp->mtx_buf);
 				DB_ASSERT(env, !h_locked);
 				return (ret);
@@ -596,7 +639,7 @@ this_buffer:	/*
 				MUTEX_READLOCK(env, hp->mtx_hash);
 			} else {
 				need_free = (atomic_dec(env, &bhp->ref) == 0);
-				F_CLR(bhp, BH_EXCLUSIVE);
+				BH_CLR_EXCLUSIVE(bhp);
 				MUTEX_UNLOCK(env, bhp->mtx_buf);
 				if (need_free) {
 					MPOOL_REGION_LOCK(env, infop);
@@ -687,7 +730,7 @@ next_hb:		if (bhp != NULL) {
 				DB_ASSERT(env, BH_REFCOUNT(bhp) > 0);
 				atomic_dec(env, &bhp->ref);
 				if (b_lock) {
-					F_CLR(bhp, BH_EXCLUSIVE);
+					BH_CLR_EXCLUSIVE(bhp);
 					MUTEX_UNLOCK(env, bhp->mtx_buf);
 				}
 			}
@@ -721,4 +764,256 @@ __memp_free(infop, buf)
 	void *buf;
 {
 	__env_alloc_free(infop, buf);
+}
+
+/*
+ * __memp_purge_obsolete --
+ *	Proactively reclaim obsolete MVCC version buffers -- those that no
+ *	active reader's snapshot can ever see again -- so the committed
+ *	snapshot TXN_DETAILs their versions pin (parked on region->mvcc_txn
+ *	with TXN_DTL_SNAPSHOT and their mvcc_mtx retained) get freed without
+ *	waiting for cache-allocation pressure to revisit the bucket.
+ *
+ *	Why this exists: __memp_alloc frees obsolete versions ONLY when it is
+ *	hunting an eviction victim in a bucket.  With a large cache and a wide
+ *	keyspace that never fills it, an obsolete version's bucket is never
+ *	rescanned, so its detail (and mvcc_mtx slot) is retained without bound
+ *	(#138).  This routine, called from the checkpoint path, walks every
+ *	bucket once and frees exactly the buffers __memp_alloc would have
+ *	freed as obsolete -- reusing the SAME BH_OBSOLETE test, the SAME
+ *	hp->old_reader advance, and the SAME __memp_bhfree/__txn_remove_buffer
+ *	free path.  It introduces NO new reclamation protocol and NO new lock
+ *	ordering.
+ *
+ *	CORRECTNESS INVARIANT: a version is freed only when BH_OBSOLETE says
+ *	its successor version is already visible to the oldest reader -- i.e.
+ *	no live reader can ever read this version again.  We compute the
+ *	oldest-reader frontier once up front and only advance hp->old_reader
+ *	toward it (never past a value some reader might still need), exactly
+ *	as __memp_alloc does.  We never free a version any active snapshot can
+ *	still see.
+ *
+ *	This is best effort: any buffer that is busy (referenced, dirty,
+ *	frozen, or momentarily latched by another thread) is simply skipped;
+ *	it will be revisited at the next checkpoint or by eviction.
+ *
+ * PUBLIC: int __memp_purge_obsolete __P((ENV *));
+ */
+int
+__memp_purge_obsolete(env)
+	ENV *env;
+{
+	BH *bhp, *current_bhp, *oldest_bhp;
+	DB_LSN oldest_reader, vlsn;
+	DB_MPOOL *dbmp;
+	DB_MPOOL_HASH *hp;
+	MPOOL *c_mp, *mp;
+	MPOOLFILE *bh_mfp;
+	REGINFO *infop;
+	u_int32_t bucket;
+	u_int i;
+	int ret;
+
+	if (!MPOOL_ON(env) || !TXN_ON(env))
+		return (0);
+
+	dbmp = env->mp_handle;
+	mp = dbmp->reginfo[0].primary;
+	ret = 0;
+	ZERO_LSN(vlsn);
+
+	/*
+	 * The visibility frontier.  A version is reclaimable only if the
+	 * next-newer version is already visible to this LSN -- i.e. no active
+	 * reader could ever see the older version.  Computed once; each bucket
+	 * advances its cached hp->old_reader toward it under mtx_hash, mirroring
+	 * __memp_alloc.
+	 */
+	if ((ret = __txn_oldest_reader(env, &oldest_reader)) != 0)
+		return (ret);
+
+	for (i = 0; i < mp->nreg; ++i) {
+		infop = &dbmp->reginfo[i];
+		c_mp = infop->primary;
+		hp = R_ADDR(infop, c_mp->htab);
+		for (bucket = 0; bucket < c_mp->htab_buckets; ++hp, ++bucket) {
+			/* Cheap unlocked skip of empty buckets. */
+			if (SH_TAILQ_FIRST(&hp->hash_bucket, __bh) == NULL)
+				continue;
+
+retry_bucket:			MUTEX_LOCK(env, hp->mtx_hash);
+
+			/*
+			 * Advance this bucket's cached oldest-reader LSN toward
+			 * the frontier -- never past it.  Same guarded advance
+			 * __memp_alloc performs.
+			 */
+			if (LOG_COMPARE(&oldest_reader, &hp->old_reader) > 0)
+				hp->old_reader = oldest_reader;
+
+			/*
+			 * Find an obsolete buffer at the END of an MVCC chain --
+			 * the only kind __memp_alloc frees as obsolete.  We free
+			 * at most one per lock acquisition, then re-lock, because
+			 * __memp_bhfree drops mtx_hash while freeing.
+			 */
+			bhp = NULL;
+			SH_TAILQ_FOREACH(current_bhp,
+			    &hp->hash_bucket, hq, __bh) {
+				/* Singletons are handled by normal eviction. */
+				if (SH_CHAIN_SINGLETON(current_bhp, vc))
+					continue;
+				/* Walk to the oldest (last) version in the chain. */
+				for (oldest_bhp = current_bhp;
+				    SH_CHAIN_HASPREV(oldest_bhp, vc);
+				    oldest_bhp =
+				    SH_CHAIN_PREV(oldest_bhp, vc, __bh))
+					continue;
+				if (BH_REFCOUNT(oldest_bhp) != 0 ||
+				    F_ISSET(oldest_bhp,
+				    BH_DIRTY | BH_FROZEN | BH_EXCLUSIVE))
+					continue;
+				if (!BH_OBSOLETE(oldest_bhp,
+				    hp->old_reader, vlsn))
+					continue;
+				bhp = oldest_bhp;
+				break;
+			}
+
+			if (bhp == NULL) {
+				MUTEX_UNLOCK(env, hp->mtx_hash);
+				continue;
+			}
+
+			/*
+			 * Claim the buffer exclusively, mirroring __memp_alloc:
+			 * take a reference, drop mtx_hash, trylock mtx_buf (never
+			 * block -- a caller may hold locks), re-lock mtx_hash, and
+			 * re-verify the buffer is still the free-able obsolete
+			 * oldest version before calling __memp_bhfree.
+			 */
+			atomic_inc(env, &bhp->ref);
+			MUTEX_UNLOCK(env, hp->mtx_hash);
+
+			if ((ret = MUTEX_TRYLOCK(env, bhp->mtx_buf)) != 0) {
+				atomic_dec(env, &bhp->ref);
+				if (ret != DB_LOCK_NOTGRANTED)
+					return (ret);
+				ret = 0;
+				continue;
+			}
+			BH_SET_EXCLUSIVE(bhp);
+			MUTEX_LOCK(env, hp->mtx_hash);
+
+			/*
+			 * Re-verify under both latches: another thread may have
+			 * referenced, dirtied, frozen, extended, or already freed
+			 * (making it a singleton) this buffer, or a new reader may
+			 * have made it no longer obsolete.  Any of those and we
+			 * release and move on -- exactly __memp_alloc's re-checks.
+			 */
+			if (BH_REFCOUNT(bhp) != 1 ||
+			    F_ISSET(bhp, BH_DIRTY | BH_FROZEN) ||
+			    SH_CHAIN_HASPREV(bhp, vc) ||
+			    !SH_CHAIN_HASNEXT(bhp, vc) ||
+			    !BH_OBSOLETE(bhp, hp->old_reader, vlsn)) {
+				atomic_dec(env, &bhp->ref);
+				BH_CLR_EXCLUSIVE(bhp);
+				MUTEX_UNLOCK(env, bhp->mtx_buf);
+				MUTEX_UNLOCK(env, hp->mtx_hash);
+				continue;
+			}
+
+			bh_mfp = R_ADDR(dbmp->reginfo, bhp->mf_offset);
+
+			/*
+			 * Free the buffer for real.  __memp_bhfree unlinks it from
+			 * the version chain, calls __txn_remove_buffer (which drops
+			 * the owning detail's mvcc_ref and frees the detail + its
+			 * mvcc_mtx when it reaches 0 -- the reclamation we want),
+			 * releases mtx_hash and mtx_buf, and returns the memory.
+			 */
+			if ((ret = __memp_bhfree(dbmp, infop,
+			    bh_mfp, hp, bhp, BH_FREE_FREEMEM)) != 0)
+				return (ret);
+
+			/* Bucket may hold more obsolete versions; rescan it. */
+			goto retry_bucket;
+		}
+	}
+
+	return (ret);
+}
+
+/*
+ * __memp_bh_pinned --
+ *	RFC 0007 phase 1: is this frame referenced by any LIVE thread's pin
+ *	list?  Eviction must not reuse a frame that an optimistic (pin-free)
+ *	reader is looking at, and bhp->ref no longer tells it -- the per-thread
+ *	pin record does.
+ *
+ *	A stale pin left behind by a DEAD process must NOT block eviction, or a
+ *	single SIGKILLed reader wedges that frame (and, once enough frames are
+ *	wedged, the whole pool) until failchk runs.  So a pin only counts when
+ *	the owning thread of control is (a) in a state that means it is inside
+ *	the library and (b) alive according to the application's is_alive
+ *	callback, when one is configured.
+ *
+ *	When no is_alive callback is configured (the default) liveness cannot be
+ *	established, and this returns "pinned" for any in-use slot -- exactly
+ *	the behaviour bhp->ref had, since a dead process's leaked ref also
+ *	blocked eviction.  DB_ENV->set_isalive is what buys the improvement, and
+ *	that is already the documented requirement for failchk.
+ *
+ * PUBLIC: int __memp_bh_pinned __P((ENV *, REGINFO *, BH *));
+ */
+int
+__memp_bh_pinned(env, infop, bhp)
+	ENV *env;
+	REGINFO *infop;
+	BH *bhp;
+{
+	DB_ENV *dbenv;
+	DB_HASHTAB *htab;
+	DB_MPOOL *dbmp;
+	DB_THREAD_INFO *ip;
+	PIN_LIST *list, *lp;
+	roff_t b_ref;
+	u_int32_t i;
+	int region;
+
+	if ((htab = env->thr_hashtab) == NULL)
+		return (0);
+	dbenv = env->dbenv;
+	dbmp = env->mp_handle;
+	b_ref = R_OFFSET(infop, bhp);
+	region = (int)(infop - dbmp->reginfo);
+
+	for (i = 0; i < env->thr_nbucket; i++)
+		SH_TAILQ_FOREACH(ip, &htab[i], dbth_links, __db_thread_info) {
+			/*
+			 * A slot not in use, or one whose thread has left the
+			 * library, cannot be mid-descent.  THREAD_OUT is the
+			 * normal idle state and its pin list must be empty; if
+			 * it is not, the owner died holding pins.
+			 */
+			if (ip->dbth_state == THREAD_SLOT_NOT_IN_USE ||
+			    ip->dbth_state == THREAD_BLOCKED_DEAD)
+				continue;
+			if (ip->dbth_pincount == 0)
+				continue;
+			/*
+			 * Dead owner: its pins are garbage that failchk will
+			 * reclaim.  Do not let them block eviction.
+			 */
+			if (ALIVE_ON(env) && !dbenv->is_alive(
+			    dbenv, ip->dbth_pid, ip->dbth_tid, 0))
+				continue;
+
+			list = R_ADDR(env->reginfo, ip->dbth_pinlist);
+			for (lp = list; lp < &list[ip->dbth_pinmax]; lp++)
+				if (lp->b_ref == b_ref && lp->region == region)
+					return (1);
+		}
+	return (0);
 }

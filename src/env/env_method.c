@@ -116,25 +116,33 @@ void
 __db_env_destroy(dbenv)
 	DB_ENV *dbenv;
 {
-	__lock_env_destroy(dbenv);
-	__log_env_destroy(dbenv);
-	__memp_env_destroy(dbenv);
-#ifdef HAVE_REPLICATION
-	__rep_env_destroy(dbenv);
-#endif
-	__txn_env_destroy(dbenv);
-
 	/*
-	 * Discard the underlying ENV structure.
-	 *
-	 * XXX
-	 * This is wrong, but can't be fixed until we finish the work of
-	 * splitting up the DB_ENV and ENV structures so that we don't
-	 * touch anything in the ENV as part of the above calls to subsystem
-	 * DB_ENV cleanup routines.
+	 * The subsystem destructors and the ENV teardown below all dereference
+	 * dbenv->env.  On the early-failure path in __env_create (the ENV calloc
+	 * itself failed) dbenv->env is still NULL, so guard the whole ENV cleanup
+	 * -- there is nothing to tear down and dereferencing it would crash.
 	 */
-	memset(dbenv->env, CLEAR_BYTE, sizeof(ENV));
-	__os_free(NULL, dbenv->env);
+	if (dbenv->env != NULL) {
+		__lock_env_destroy(dbenv);
+		__log_env_destroy(dbenv);
+		__memp_env_destroy(dbenv);
+#ifdef HAVE_REPLICATION
+		__rep_env_destroy(dbenv);
+#endif
+		__txn_env_destroy(dbenv);
+
+		/*
+		 * Discard the underlying ENV structure.
+		 *
+		 * XXX
+		 * This is wrong, but can't be fixed until we finish the work of
+		 * splitting up the DB_ENV and ENV structures so that we don't
+		 * touch anything in the ENV as part of the above calls to subsystem
+		 * DB_ENV cleanup routines.
+		 */
+		memset(dbenv->env, CLEAR_BYTE, sizeof(ENV));
+		__os_free(NULL, dbenv->env);
+	}
 
 	memset(dbenv, CLEAR_BYTE, sizeof(DB_ENV));
 	__os_free(NULL, dbenv);
@@ -827,6 +835,7 @@ const FLAG_MAP EnvMap[] = {
 	{ DB_DIRECT_DB,		DB_ENV_DIRECT_DB },
 	{ DB_DSYNC_DB,		DB_ENV_DSYNC_DB },
 	{ DB_HOTBACKUP_IN_PROGRESS, DB_ENV_HOTBACKUP },
+	{ DB_MPOOL_AIO,		DB_ENV_MPOOL_AIO },
 	{ DB_MULTIVERSION,	DB_ENV_MULTIVERSION },
 	{ DB_NOFLUSH,		DB_ENV_NOFLUSH },
 	{ DB_NOLOCKING,		DB_ENV_NOLOCKING },
@@ -837,6 +846,7 @@ const FLAG_MAP EnvMap[] = {
 	{ DB_TIME_NOTGRANTED,	DB_ENV_TIME_NOTGRANTED },
 	{ DB_TXN_NOSYNC,	DB_ENV_TXN_NOSYNC },
 	{ DB_TXN_NOWAIT,	DB_ENV_TXN_NOWAIT },
+	{ DB_TXN_SERIALIZABLE,	DB_ENV_TXN_SERIALIZABLE },
 	{ DB_TXN_SNAPSHOT,	DB_ENV_TXN_SNAPSHOT },
 	{ DB_TXN_WRITE_NOSYNC,	DB_ENV_TXN_WRITE_NOSYNC },
 	{ DB_YIELDCPU,		DB_ENV_YIELDCPU }
@@ -939,11 +949,13 @@ __env_set_flags(dbenv, flags, on)
 
 #define	OK_FLAGS							\
 	(DB_AUTO_COMMIT | DB_CDB_ALLDB | DB_DATABASE_LOCKING |		\
-	    DB_DIRECT_DB | DB_DSYNC_DB |  DB_MULTIVERSION |		\
+	    DB_DIRECT_DB | DB_DSYNC_DB |  DB_MPOOL_AIO |		\
+	    DB_MULTIVERSION |						\
 	    DB_NOLOCKING | DB_NOMMAP | DB_NOPANIC | DB_OVERWRITE |	\
 	    DB_PANIC_ENVIRONMENT | DB_REGION_INIT |			\
 	    DB_TIME_NOTGRANTED | DB_TXN_NOSYNC | DB_TXN_NOWAIT |	\
-	    DB_TXN_SNAPSHOT | DB_TXN_WRITE_NOSYNC | DB_YIELDCPU |	\
+	    DB_TXN_SERIALIZABLE | DB_TXN_SNAPSHOT |			\
+	    DB_TXN_WRITE_NOSYNC | DB_YIELDCPU |				\
 	    DB_HOTBACKUP_IN_PROGRESS | DB_NOFLUSH)
 
 	if (LF_ISSET(~OK_FLAGS))

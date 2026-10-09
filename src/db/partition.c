@@ -274,7 +274,7 @@ __partition_open(dbp, ip, txn, fname, type, flags, mode, do_open)
 	DB_PARTITION *part;
 	DBC *dbc;
 	ENV *env;
-	u_int32_t part_id;
+	u_int32_t cq_i, part_id;
 	int ret;
 	char *name, *sp;
 	const char **dirp, *np;
@@ -357,9 +357,12 @@ __partition_open(dbp, ip, txn, fname, type, flags, mode, do_open)
 	}
 
 	/* Get rid of the cursor used to open the database its the wrong type */
-done:	while ((dbc = TAILQ_FIRST(&dbp->free_queue)) != NULL)
-		if ((ret = __dbc_destroy(dbc)) != 0)
-			break;
+done:	for (cq_i = 0; cq_i < DB_CURSOR_NPART; cq_i++)
+		while ((dbc =
+		    TAILQ_FIRST(&dbp->cq_parts[cq_i].free_queue)) != NULL)
+			if ((ret = __dbc_destroy(dbc)) != 0)
+				goto donebreak;
+donebreak:
 
 	if (0) {
 err:		(void)__partition_close(dbp, txn, 0);
@@ -1822,16 +1825,32 @@ __part_verify(dbp, vdp, fname, handle, callback, flags)
 	dbc = NULL;
 	ip = vdp->thread_info;
 
-	if (dbp->type == DB_BTREE) {
+	if (dbp->type == DB_BTREE || dbp->type == DB_RECNO) {
 		if ((ret = __bam_open(dbp, ip,
 		    NULL, fname, PGNO_BASE_MD, flags)) != 0)
 			goto err;
 	}
 #ifdef HAVE_HASH
-	else if ((ret = __ham_open(dbp, ip,
-	    NULL, fname, PGNO_BASE_MD, flags)) != 0)
-		goto err;
+	else if (dbp->type == DB_HASH) {
+		if ((ret = __ham_open(dbp, ip,
+		    NULL, fname, PGNO_BASE_MD, flags)) != 0)
+			goto err;
+	}
 #endif
+	else {
+		/*
+		 * Only Btree/Recno and Hash databases can be partitioned.  A
+		 * corrupt/hostile file whose meta page claims another type (e.g.
+		 * Heap or Queue) while setting the partition flag must not be
+		 * opened with the Hash access method: __db_cursor would allocate
+		 * a cursor sized for dbp->type, which __ham_get_meta then casts
+		 * to HASH_CURSOR, writing its hlock field past the end of the
+		 * smaller allocation (a heap-buffer-overflow / type confusion).
+		 * Reject the unexpected type instead.
+		 */
+		ret = __db_unknown_type(env, "__part_verify", dbp->type);
+		goto err;
+	}
 
 	/*
 	 * Initalize partition db handles and get the names. Set DB_RDWRMASTER

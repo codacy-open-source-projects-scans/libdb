@@ -84,16 +84,9 @@ typedef signed int atomic_value_t;
  * additional 32-bit value that can be harmlessly written for each value
  * used in Interlocked instructions.
  */
-#if defined(DB_WINCE)
-typedef struct {
-	volatile atomic_value_t value;
-	volatile atomic_value_t dummy;
-} db_atomic_t;
-#else
 typedef struct {
 	volatile atomic_value_t value;
 } db_atomic_t;
-#endif
 
 /*
  * Memory ordering constants for future use with relaxed/acquire/release
@@ -115,7 +108,28 @@ typedef struct {
  * Modification operations delegate to ENV-aware functions.
  */
 #define	atomic_read(p)		__os_atomic_read(p)
+/*
+ * atomic_init collides with the C++ <atomic> free function std::atomic_init
+ * (and C11 <stdatomic.h> atomic_init).  MSVC's C++ standard library pulls
+ * <atomic> into any C++ translation unit, and the macro would rewrite that
+ * declaration -> compile failure.  Berkeley DB only calls atomic_init() from
+ * C sources, so define the macro only for C.
+ */
+#if !defined(__cplusplus)
 #define	atomic_init(p, val)	__os_atomic_init((p), (val))
+#endif
+
+/*
+ * atomic_read_relaxed: torn-read-free load with no ordering, for pure
+ * statistics counters where the ACQUIRE fence of atomic_read is wasted.
+ * Falls back to atomic_read when the backend has no relaxed variant.
+ */
+#if (defined(HAVE_ATOMIC_STDATOMIC) || defined(HAVE_ATOMIC_GCC_BUILTIN)) && \
+    defined(HAVE_ATOMIC_SUPPORT)
+#define	atomic_read_relaxed(p)	__os_atomic_read_relaxed(p)
+#else
+#define	atomic_read_relaxed(p)	__os_atomic_read(p)
+#endif
 
 #ifdef HAVE_ATOMIC_SUPPORT
 

@@ -204,6 +204,19 @@ __db_create_internal(dbpp, env, flags)
 	return (0);
 
 err:	if (dbp != NULL) {
+		/*
+		 * Free the access-method-specific handle state (bt_internal,
+		 * h_internal, q_internal, ...) that the __{bam,ham,heap,qam}_
+		 * db_create calls above may already have allocated before a later
+		 * failure on this path.  The close routines are NULL-safe (they
+		 * no-op when their *_internal is unset), so this is safe whether
+		 * or not each was reached.  Without this the handle's AM state
+		 * leaks -- *dbpp is left NULL, so the caller cannot free it either.
+		 */
+		(void)__bam_db_close(dbp);
+		(void)__ham_db_close(dbp);
+		(void)__heap_db_close(dbp);
+		(void)__qam_db_close(dbp, 0);
 		if (dbp->mpf != NULL)
 			(void)__memp_fclose(dbp->mpf, 0);
 		__os_free(env, dbp);
@@ -230,8 +243,15 @@ __db_init(dbp, flags)
 	dbp->alt_close = NULL;
 	LOCK_INIT(dbp->handle_lock);
 
-	TAILQ_INIT(&dbp->free_queue);
-	TAILQ_INIT(&dbp->active_queue);
+	{
+		u_int32_t cqi;
+
+		for (cqi = 0; cqi < DB_CURSOR_NPART; cqi++) {
+			dbp->cq_parts[cqi].mutex = MUTEX_INVALID;
+			TAILQ_INIT(&dbp->cq_parts[cqi].free_queue);
+			TAILQ_INIT(&dbp->cq_parts[cqi].active_queue);
+		}
+	}
 	TAILQ_INIT(&dbp->join_queue);
 	LIST_INIT(&dbp->s_secondaries);
 

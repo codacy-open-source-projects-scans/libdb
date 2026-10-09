@@ -1,0 +1,513 @@
+# test/MANIFEST -- the test-execution manifest.
+#
+# THE SOURCE OF TRUTH for "which tests are expected to actually run".
+# test/check_manifest.sh compares this against the RESULT lines the tier
+# runners emit (see test/harness.sh) and FAILS when a listed test produced no
+# verdict.  A test that nobody invoked is a vacuous green; this file is what
+# makes that state detectable instead of indistinguishable from success.
+#
+# FORMAT (deliberately not TOML/YAML/JSON):
+#
+#     <tier> <name> [optional]
+#
+# One flat, line-oriented, comment-friendly file.  Chosen over MANIFEST.toml
+# and over per-tier EXPECTED files because:
+#   - the checker must run in POSIX sh + awk on every CI runner and in the
+#     autoconf build, with no import of tomllib (absent before python 3.11) and
+#     no new build-time dependency, which the brief forbids;
+#   - one file means one place to look and one place to grep.  The historical
+#     bugs were all "two lists drifted apart" (LEAK_TESTS vs leak-run.sh,
+#     $subs vs the ssi test files).  Adding 24 more per-tier lists to keep in
+#     step would recreate exactly that failure mode;
+#   - `optional` on the third field means "run it if the tier ran at all, but
+#     an absent verdict is not a failure" -- for cases that depend on a build
+#     flag (a DIAGNOSTIC-only crash hook) or on a tier CI does not schedule on
+#     every trigger.  Everything without it is MANDATORY.
+#
+# HOW TO ADD A TEST: add the line here AND make the runner emit its verdict.
+# The gate exists so that doing only one of the two fails loudly.
+
+# ---------------------------------------------------------------------------
+# Tier B1 -- isolation / anomaly checker.   test/isolation/run.sh
+# Hard gate on every push/PR (.github/workflows/test-tiers.yml).
+#
+# Every scenario runs at BOTH isolation levels, and the level is part of the
+# expectation: "@snapshot" proves the anomaly is VISIBLE under plain SI, which
+# is what makes the "@serializable" clean run non-vacuous.  Losing one level
+# (the shape of trap 3: half the suite silently not sourced) fails here.
+# ---------------------------------------------------------------------------
+# isolation: the tier sweeps LEVEL x LOCK-PARTITION-COUNT (see ISO_PARTS in
+# test/isolation/run.sh).  Verdict names are SCENARIO@LEVEL-PARTS so that
+# dropping an entire partition pass fails this gate rather than silently
+# emitting duplicate names.  The parts=1 pass is the gate on the region-latch
+# aliasing self-deadlock (LOCK_SYSTEM_LOCK and TXN_SYSTEM_LOCK are one mutex).
+isolation	write_skew_trigger@snapshot-default
+isolation	write_skew_trigger@snapshot-1
+isolation	write_skew_trigger@serializable-default
+isolation	write_skew_trigger@serializable-1
+isolation	write_skew_control@snapshot-default
+isolation	write_skew_control@snapshot-1
+isolation	write_skew_control@serializable-default
+isolation	write_skew_control@serializable-1
+isolation	write_skew_late@snapshot-default
+isolation	write_skew_late@snapshot-1
+isolation	write_skew_late@serializable-default
+isolation	write_skew_late@serializable-1
+isolation	write_skew_samebtree_control@snapshot-default
+isolation	write_skew_samebtree_control@snapshot-1
+isolation	write_skew_samebtree_control@serializable-default
+isolation	write_skew_samebtree_control@serializable-1
+isolation	write_skew_samebtree_trigger@snapshot-default
+isolation	write_skew_samebtree_trigger@snapshot-1
+isolation	write_skew_samebtree_trigger@serializable-default
+isolation	write_skew_samebtree_trigger@serializable-1
+isolation	g2_antidep@snapshot-default
+isolation	g2_antidep@snapshot-1
+isolation	g2_antidep@serializable-default
+isolation	g2_antidep@serializable-1
+# phantom_pages is the executable gate on D10 (phantom prevention is emergent
+# from page-granularity co-location).  Unlike g2_antidep -- whose two inserts
+# land on the SAME leaf and are therefore stopped by an ordinary page write lock
+# at BOTH isolation levels, so it proves nothing about the SSI read set -- this
+# scenario puts the two inserts on DIFFERENT leaves, so only the scan's SIREAD
+# marker can prevent both from committing.  si_anomaly=1: it MUST show the
+# anomaly under DB_TXN_SNAPSHOT and MUST prevent it under DB_TXN_SERIALIZABLE,
+# which is the anti-vacuity control.
+isolation	phantom_pages@snapshot-default
+isolation	phantom_pages@snapshot-1
+isolation	phantom_pages@serializable-default
+isolation	phantom_pages@serializable-1
+isolation	read_only_anomaly@snapshot-default
+isolation	read_only_anomaly@snapshot-1
+isolation	read_only_anomaly@serializable-default
+isolation	read_only_anomaly@serializable-1
+isolation	lost_update@snapshot-default
+isolation	lost_update@snapshot-1
+isolation	lost_update@serializable-default
+isolation	lost_update@serializable-1
+isolation	read_your_writes@snapshot-default
+isolation	read_your_writes@snapshot-1
+isolation	read_your_writes@serializable-default
+isolation	read_your_writes@serializable-1
+isolation	ssi_gc_pressure@snapshot-default
+isolation	ssi_gc_pressure@snapshot-1
+isolation	ssi_gc_pressure@serializable-default
+isolation	ssi_gc_pressure@serializable-1
+isolation	ssi_crash_pivot-default	optional
+isolation	ssi_crash_pivot-1	optional
+# The two SSI mechanism gates.  ssi_gc_pressure runs at both levels (the
+# snapshot pass is the anti-vacuity control).  ssi_crash_pivot needs a
+# DIAGNOSTIC build for its in-commit crash hook, so it is optional -- but the
+# runner emits `skip` when the hook is absent, so "it did not run" is still
+# recorded rather than inferred.
+
+# ---------------------------------------------------------------------------
+# Tier B2 -- resource-accounting soak.   test/soak/run.sh
+# Scheduled/dispatch only, so every entry is optional: on a push trigger the
+# tier legitimately does not run.  What is NOT optional is the shape -- if the
+# soak runs and produces a partial set, the missing workloads fail the gate.
+# (Enforced by check_manifest.sh: a tier with SOME verdicts must have ALL its
+# mandatory ones; optional entries are only excused when the whole tier is
+# absent.)
+# ---------------------------------------------------------------------------
+soak	ro_snapshot	optional
+soak	mvcc_retained	optional
+soak	rw_plain	optional
+soak	aborted	optional
+soak	cursor_churn	optional
+
+# ---------------------------------------------------------------------------
+# Tier B3 -- lock-mode matrix under ASan.   test/lockmatrix/run.sh
+# Hard gate.  Three sections, each a real verdict.
+# ---------------------------------------------------------------------------
+lockmatrix	modes
+lockmatrix	conflicts
+lockmatrix	list
+
+# ---------------------------------------------------------------------------
+# Resource-accounting / correctness leak drivers.   test/c/leak-run.sh
+#
+# THIS IS WHERE THREE OF THE FOUR HISTORICAL TRAPS LIVED.  The list below is
+# the union of dist/Makefile.in's LEAK_TESTS and the modes leak-run.sh actually
+# runs; keeping it here means a driver added to LEAK_TESTS but never invoked
+# (trap 1) fails the gate, and a driver dropped from the runner (trap 2) does
+# too.
+#
+# FINDING: this tier is invoked by NO workflow (see the report).  It is wired
+# into ci.yml by this change, which is why the entries are mandatory.
+# ---------------------------------------------------------------------------
+leak	leak_si_locker@control
+leak	leak_si_locker@snapshot
+leak	leak_si_mvcc_mtx@no-read
+leak	leak_si_mvcc_mtx@read
+leak	health_stats@control
+leak	health_stats@si137
+leak	health_stats@si138
+leak	mvcc_purge_visible
+leak	aio_concurrent_sync@sync
+# "aio" mode has a documented known deadlock (DB_MPOOL_AIO is default-OFF); the
+# runner records it as `skip`, which is still a verdict -- the point is that the
+# line must EXIST.
+leak	aio_concurrent_sync@aio
+leak	lock_order_check@gate
+leak	batch_diff
+# The read-set equivalence probe runs OUTSIDE the batch_diff process, once per
+# key range, because lock objects are shared and whichever arm touches a range
+# first confounds an in-process measurement.  Declared per range so that
+# dropping one range cannot hide behind the other.
+leak	batch_diff@readset-0
+leak	batch_diff@readset-997
+
+# ---------------------------------------------------------------------------
+# Tier: flag -- runtime I/O and durability FLAG BEHAVIOUR.  test/c/flag-run.sh
+#
+# Closes gap G15 (rfc/0011-test-coverage-gaps.md).  DB_DIRECT, DB_DIRECT_DB,
+# DB_DSYNC_DB, DB_LOG_DIRECT, DB_LOG_DSYNC, DB_LOG_WRNOSYNC and DB_NOSYNC were
+# referenced by ZERO tests; the only test that mentioned one of them checked
+# that set_flags ACCEPTED it, which is how defect P2 shipped -- a flag under
+# which no database can be opened at all, with the coverage counter rising.
+#
+# Every entry here asserts an observable consequence: O_DIRECT / O_DSYNC read
+# back from /proc/self/fdinfo on the descriptor the library opened, or a sync
+# COUNT compared between two arms.  `control` is the anti-vacuity arm -- it
+# asserts the probe reports the bits ABSENT by default, so a probe that always
+# answered "present" fails instead of passing everything.
+#
+# MANDATORY vs optional:
+#   The O_DIRECT modes need an --enable-o_direct build (without it
+#   __os_support_direct_io() is 0 and the flag is correctly refused), so they
+#   are optional -- but the runner PRINTS the skip reason, and the o_direct leg
+#   of the option sweep (test/config/option_sweep.sh) builds with it.
+#   Everything else needs no build option and is mandatory.
+#
+#   direct_db reports XFAIL against P2 on hardware whose kernel tolerates an
+#   unaligned O_DIRECT buffer; XFAIL counts as a verdict that held.  direct_log
+#   no longer has an XFAIL allowance at all -- P3 is fixed
+#   (test/c/P3-LOG-ODIRECT.md) and a failed transactional open under
+#   DB_LOG_DIRECT is now a hard FAIL.
+# ---------------------------------------------------------------------------
+flag	control
+flag	dsync_db
+flag	dsync_log
+flag	p2_align
+flag	p3_align
+flag	direct_db	optional
+flag	direct_log	optional
+flag	direct_mpf	optional
+# P3's on-the-real-library check: every pread/pwrite the library issues against
+# a log file under DB_LOG_DIRECT must be 4096-aligned in BOTH offset and length.
+# p3_align models that arithmetic; this reads the syscalls, so the model and the
+# code cannot drift apart silently.  Optional: needs strace and --enable-o_direct.
+flag	direct_log@io	optional
+
+# ---------------------------------------------------------------------------
+# Tier: p3durable -- the DURABILITY proof for the P3 fix.
+# test/c/p3-durable-run.sh
+#
+# The flag tier proves DB_LOG_DIRECT WORKS (the open completes, the fd is
+# O_DIRECT, every log I/O is aligned).  None of that proves it is SAFE:
+# __log_write_direct rewrites the leading partial block of every write and
+# zero-pads the trailing one, so it touches bytes belonging to records that were
+# already fsync'd and ACKED DURABLE.  If the restaging is wrong, a committed
+# transaction disappears.  This project already shipped one "fast liar"
+# (__memp_aio_drain swallowing write errors while reporting durability), so the
+# bar here is a real SIGKILL with no clean close and no checkpoint anywhere.
+#
+#   p3durable@ack     N commits acked DB_TXN_SYNC under DB_LOG_DIRECT, the
+#                     process SIGKILLed, then recovered: every acked commit must
+#                     be present with byte-correct contents.  The count comes
+#                     from the writer's own DURABLE-ACK lines, so a writer that
+#                     died early cannot make the gate easier by acking fewer.
+#   p3durable@verify  db_verify on the recovered database -- the right keys in a
+#                     corrupt btree is still corruption.
+#   p3durable@group   group commit intact under the flag, compared against the
+#                     BUFFERED arm: a fix that serialized the log would still
+#                     pass an absolute fsync-count threshold.
+#
+# All optional: they need an --enable-o_direct build, and the runner prints the
+# skip reason rather than vanishing.
+# ---------------------------------------------------------------------------
+p3durable	p3durable@ack		optional
+p3durable	p3durable@verify	optional
+p3durable	p3durable@group		optional
+# DB_LOG_WRNOSYNC: per-arm verdicts PLUS the cross-arm comparison.  The
+# comparison is its own entry because the two arms can each succeed while the
+# flag does nothing -- which is precisely what the count check catches.
+flag	syncs@default
+flag	syncs@wrnosync
+flag	syncs@count
+# DB_NOSYNC: the assertion IS the fsync syscall count, so the per-arm runs are
+# mandatory and the count entry is optional only because it needs strace.
+flag	closesync@sync
+flag	closesync@nosync
+flag	closesync@count	optional
+
+# ---------------------------------------------------------------------------
+# Tier: flagapi -- API FLAG BEHAVIOUR, second wave.  test/c/flagapi-run.sh
+#
+# The `flag` tier above covers the seven runtime I/O and durability flags.
+# test/TESTING-PROGRAM.md then measured the WHOLE surface and
+# found 112 of 229 public API flags (48%) referenced by NO test at all.  This
+# tier covers the next two priority bands from that document, in defect-yield
+# order:
+#
+#   1. backup and archive -- DATA-LOSS ADJACENT.  DB_ARCH_REMOVE UNLINKS LOG
+#      FILES, so a defect there destroys the record of committed transactions;
+#      DB_BACKUP_NO_LOGS decides whether a backup contains the logs it needs to
+#      be recoverable at all.  Nothing tested any of them.
+#   2. everything else to which an observable consequence can be attached.
+#
+# The bar is the observable consequence, never the return code: a file created
+# or removed, a byte pattern on disk at unlink time, a stat counter that moved,
+# a record visible or not, a stat section present or absent, an elapsed time.
+# G15 established why -- cov_api_surface.c "covered" DB_DIRECT_DB by checking
+# that set_flags ACCEPTED it, while no database could be opened under it (P2).
+#
+# THREE ENGINE DEFECTS THIS TIER FOUND.  All three are recorded as XFAIL, which
+# counts as a verdict that HELD, and every one flips to PASS with no edit to the
+# test once the engine is fixed.  FLAGAPI_STRICT=1 refuses the allowance, which
+# is how they are shown to have teeth.
+#
+#   backup_nologs   P6  FIXED (v2026.09.12) -- guarded at the backup_read_log_dir
+#                       call; now a FAIL branch, and the mode the tier's sabotage
+#                       teeth use (test/c/flagapi-sabotage.sh).
+#   inorder@inorder P7  FIXED (PR #205).  This mode now reports PASS with no edit
+#                       to the driver -- which is what the in-driver watchdog was
+#                       for: the XFAIL retires itself when the defect goes away.
+#                       98% CPU (retry label in __qamc_get hit >100,000 times
+#                       without terminating, vs 22 for the default arm).
+#   noflush@noflush P8  FIXED (v2026.09.12) -- now a FAIL branch: SIGBUS on a
+#                       shared env (region file left zero-length),
+#                       DB_PAGE_NOTFOUND on a private one.
+#
+# Every entry is MANDATORY.  None needs a build option: unlike the `flag` tier's
+# O_DIRECT modes there is nothing here that a stock configure cannot exercise,
+# and nothing here depends on strace.  So an absent verdict is a failure, with
+# no "optional" to hide behind.
+# ---------------------------------------------------------------------------
+# Archive and backup -- the data-loss-adjacent band, first.
+flagapi	arch_log
+flagapi	arch_data
+flagapi	arch_abs
+flagapi	arch_remove
+flagapi	backup_nologs
+flagapi	backup_update
+# DB_SEQUENCE flags, graded on the VALUES returned, not on set_flags succeeding.
+flagapi	seq_dir@inc
+flagapi	seq_dir@dec
+flagapi	seq_wrap
+flagapi	seq_range
+# DB_TXN_FAMILY: sibling children share locks where independent txns deadlock.
+flagapi	txn_family
+# DB_TXN_WAIT: per-arm runs PLUS the cross-arm TIME comparison.  The comparison
+# is its own entry because both arms return DB_LOCK_DEADLOCK -- grading on the
+# error code would pass a build where the flag was ignored entirely, so the
+# 0ms-vs-2000ms difference is the only thing that distinguishes them.
+flagapi	txn_wait@nowait
+flagapi	txn_wait@wait
+flagapi	txn_wait@time
+# DB_CURSOR_BULK: every record stored through a bulk cursor reads back intact.
+flagapi	cursor_bulk
+# DB_INORDER: both arms.  The default arm is what makes the XFAIL meaningful --
+# it drains the same queue over the same hole and completes, so P7 cannot be
+# blamed on the workload.
+flagapi	inorder@default
+flagapi	inorder@inorder
+# DB_FREELIST_ONLY: pages returned to the filesystem AND every surviving record
+# still readable.  A compaction that truncated live data passes a return-code
+# check and fails here.
+flagapi	freelist_only
+# DB_NOLOCKING: per-arm runs PLUS the cross-arm lock-request COUNT.  Each arm
+# also asserts every record read back correctly, because an arm that stopped
+# doing the work would also stop requesting locks.
+flagapi	nolocking@default
+flagapi	nolocking@nolocking
+flagapi	nolocking@count
+# DB_OVERWRITE: the bytes in the region file AT UNLINK TIME, read from inside a
+# db_env_set_func_unlink hook.  The default arm must find the real contents and
+# the flagged arm a uniform 0xff pattern; without the control, "it was
+# overwritten" could be something else zeroing region files.
+flagapi	overwrite@default
+flagapi	overwrite@overwrite
+# DB_NOFLUSH: both arms.  The default arm proves the two environment shapes the
+# flagged arm fails in are otherwise fine, which is what makes P8 attributable
+# to the flag.
+flagapi	noflush@default
+flagapi	noflush@noflush
+# DB_HOTBACKUP_IN_PROGRESS: reads back while set, and GONE after the paired
+# clear -- the flag is reference-counted, so the clear half is the real check.
+flagapi	hotbackup
+# DB_STAT_LOCK_CONF / _OBJECTS / _PARAMS and DB_STAT_SUMMARY: each flag's own
+# section present with it and ABSENT without it.  Not graded on output size: a
+# section flag SUPPRESSES the default counter block, so every flagged arm is
+# smaller than the plain one even when the flag works.
+flagapi	stat_sections
+flagapi	stat_summary
+# DB->verify flags, graded on the salvage OUTPUT: DB_SALVAGE non-empty,
+# DB_PRINTABLE containing the stored value literally where raw salvage escapes
+# it, DB_AGGRESSIVE still producing the records, DB_ORDERCHKONLY accepted on a
+# named subdatabase and writing no dump.
+flagapi	verify_flags
+
+# ---------------------------------------------------------------------------
+# Tier: config -- the configure-option sweep.  test/config/option_sweep.sh
+#
+# Closes gap G14: 42 of 54 configure options were never built in CI, including
+# --enable-o_direct, which is how defect P2 survived -- nothing ever compiled
+# or ran that path.
+#
+# ONE OPTION AT A TIME (never combinatorially), and options that change RUNTIME
+# behaviour additionally run test/config/config_smoke.c, because
+# --enable-o_direct builds perfectly and fails at runtime: a build-only sweep
+# would have reported it green.
+#
+# `complete` is the completeness gate itself, and it is MANDATORY and listed
+# FIRST: every configure option must be in a sweep list or on the commented
+# exclusion list, so adding an option forces a testing decision.  That is the
+# same discipline this file applies to tests.  Without this entry a sweep could
+# run every leg it knows about against a list that had silently lost half the
+# options.
+#
+# The per-option legs are `optional` because the sweep is a NIGHTLY job that
+# needs ~30 configure+build cycles (roughly 40 min on 12 jobs), not a per-PR
+# gate -- but once the tier runs at all, check_manifest.sh reports each absent
+# leg, and option_sweep.sh separately fails if the number of recorded legs does
+# not match the number planned.  A leg that wrote no row did not run.
+# ---------------------------------------------------------------------------
+config	complete
+# --- smoke legs (build + run the runtime smoke suite) ---
+config	o_direct	optional
+config	atomicsupport	optional
+config	atomicfileread	optional
+config	mutexsupport	optional
+config	mutex	optional
+config	posixmutexes	optional
+config	umrw	optional
+config	stacksize	optional
+config	log_checksum	optional
+config	partition	optional
+config	hash	optional
+config	heap	optional
+config	queue	optional
+config	replication	optional
+config	statistics	optional
+config	verify	optional
+config	compression	optional
+config	smallbuild	optional
+config	debug_rop	optional
+config	debug_wop	optional
+config	diagnostic	optional
+config	debug	optional
+config	dst	optional
+config	faultinject	optional
+config	handoff-trace	optional
+config	cryptography	optional
+config	localization	optional
+config	stripped_messages	optional
+config	uniquename	optional
+# --- build-only legs (bindings/utilities; they do not change the engine) ---
+config	cxx	optional
+config	stl	optional
+config	dbm	optional
+config	compat185	optional
+# --- KNOWN-INTERACTING PAIRS -----------------------------------------------
+# One-at-a-time sweeping cannot see interactions, and 2^54 is not a target, so
+# this is a small NAMED list where each entry states the interaction it is worth
+# minutes for (the reasons live in SWEEP_PAIRS in test/config/option_sweep.sh,
+# and a pair with no stated reason FAILS its leg rather than running).
+#
+# These are extra LEGS, not a new population of options: every configure option
+# is still in exactly one of the smoke/build-only/excluded lists above, so
+# --check-complete is unaffected and "an unlisted option fails the gate" still
+# holds.
+#
+# Optional for the same reason as every other config leg: the tier is a
+# multi-build sweep CI does not schedule on every trigger, and the runner prints
+# why a leg was skipped rather than vanishing.
+config	pair:diagnostic-x-o_direct		optional
+config	pair:smallbuild-x-statistics		optional
+config	pair:mutexsupport-x-atomicsupport	optional
+config	pair:replication-x-cryptography		optional
+config	pair:diagnostic-x-smallbuild		optional
+
+# ---------------------------------------------------------------------------
+# Tier: shape -- the SCALING-SHAPE gate.  test/bench/scale_shape_gate.sh
+#
+# Closes gaps G12 + G13.  libdb's TPROC-C throughput PEAKS AT 8 THREADS and
+# falls to 32% of that peak by 96, while WiredTiger rises monotonically; all 34
+# CI jobs run on a 2-4 vCPU ubuntu-latest runner that CANNOT produce the
+# contention, and the one perf job is continue-on-error "informational only".
+#
+# The gate asserts SHAPE -- median tpm(t=32) >= median tpm(t=8) within a
+# tolerance derived from the reps' own spread -- not an absolute number, because
+# a shape comparison is between two measurements minutes apart on the same box
+# and so survives a machine-class change that would invalidate a stored number.
+#
+# `selftest` is the TEETH entry and is MANDATORY: it feeds the same verdict code
+# the measured libdb shape (must FAIL) and the measured WiredTiger shape (must
+# PASS).  It needs no benchmark run and takes seconds, so it is the one entry
+# that can be mandatory everywhere.  It has already earned its place -- it
+# caught a ModuleNotFoundError in the gate that was exiting non-zero and being
+# read as "correctly failed the descending series".
+#
+# `gate` is optional because it requires a 32+ core machine: the script REFUSES
+# to emit a verdict below 32 cores (exit 3) rather than produce a number that
+# describes the scheduler.  It runs in the nightly scale-shape workflow.
+# ---------------------------------------------------------------------------
+shape	selftest
+shape	gate	optional
+
+# ---------------------------------------------------------------------------
+# test/db/ single-bug regression runners.   Invoked directly from ci.yml's
+# build matrix (config == default).  Each script prints "<name>: PASS|FAIL".
+# ---------------------------------------------------------------------------
+db	run_hash_unsorted_cmp
+db	run_recd_compact
+db	run_recd_handlers
+db	run_upgrade
+db	run_lock_priority_nullderef
+db	run_null_method_slots
+db	run_qam_extent_vrfy
+db	run_qam_inorder_consume
+db	run_u9_serializable
+db	run_u8_backup_config
+db	run_handle_sizes
+db	run_s5_failchk_spin
+db	run_opt_null_sample
+db	run_configure_hostglob
+db	run_meson_autoconf_parity
+db	run_windows_srclist
+db	run_db_verify_multifile
+db	run_qam_readpath_bound
+db	run_curadj_dup_partition
+
+# ---------------------------------------------------------------------------
+# TCL suite.  The targeted per-push subset only (the full run_std suite is
+# ci-extended.yml and enumerating ~400 TCL tests here would be a second list
+# to drift).  These five are the ones ci.yml claims to run; trap 3 was `ssi`
+# not being sourced at all, so ssi001/ssi002 being present here is the point.
+# ---------------------------------------------------------------------------
+tcl	lock001
+tcl	txn001
+tcl	test001
+tcl	ssi001
+tcl	ssi002
+
+# ---------------------------------------------------------------------------
+# DST fault-class capstones, one per fault class.   test/sim/run_capstones.sh
+# Hard gate in ci.yml's dst job.  The old inline loop used `set -e`, so the
+# FIRST failure ended the run and the remaining capstones produced no signal at
+# all -- indistinguishable from never having been listed.
+# ---------------------------------------------------------------------------
+sim	test_sim_crash_recover
+sim	test_sim_crash_in_recovery
+sim	test_sim_clockskew_backward
+sim	test_sim_buggify
+sim	test_sim_torn
+sim	test_sim_stale
+sim	test_sim_enospc
+
+# RFC 0007 optimistic read validation.  opt_teeth.sh rebuilds a SABOTAGED
+# library (BH.gen never bumped) and requires the probe to FAIL, so this verdict
+# means the generation bump is load-bearing, not merely present.
+bench	optimistic_teeth

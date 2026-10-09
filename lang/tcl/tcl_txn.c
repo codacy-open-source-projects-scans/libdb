@@ -149,6 +149,7 @@ tcl_Txn(interp, objc, objv, dbenv, envip)
 		"-nowait",
 		"-parent",
 		"-snapshot",
+		"-snapshot_safe",
 		"-sync",
 		"-wrnosync",
 		NULL
@@ -167,6 +168,7 @@ tcl_Txn(interp, objc, objv, dbenv, envip)
 		TXNNOWAIT,
 		TXNPARENT,
 		TXNSNAPSHOT,
+		TXNSNAPSHOTSAFE,
 		TXNSYNC,
 		TXNWRNOSYNC
 	};
@@ -261,6 +263,15 @@ get_timeout:		if (i >= objc) {
 			break;
 		case TXNSNAPSHOT:
 			flag |= DB_TXN_SNAPSHOT;
+			break;
+		case TXNSNAPSHOTSAFE:
+			/*
+			 * -snapshot_safe requests serializable snapshot
+			 * isolation (SSI).  -snapshot is plain snapshot
+			 * isolation.  These are distinct public flags again
+			 * (DB_TXN_SNAPSHOT vs DB_TXN_SERIALIZABLE).
+			 */
+			flag |= DB_TXN_SERIALIZABLE;
 			break;
 		case TXNSYNC:
 			flag |= DB_TXN_SYNC;

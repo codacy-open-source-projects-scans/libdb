@@ -1,6 +1,6 @@
 # DO NOT EDIT: automatically built by dist/s_android.
 # Makefile for building Android.JDBC for DBSQL
-# Berkeley DB 11g Release 2, library version 11.2.5.3.28: (September  9, 2013)
+# libdb 2026.10.3 (October 9, 2026)
 #
 # This Makefile will generate 3 files:
 #   1. Static libdb_sql library. An internal library and users don't
@@ -210,6 +210,7 @@ LOCAL_SRC_FILES := \
 	$(BDB_TOP)/src/log/log_compare.c \
 	$(BDB_TOP)/src/log/log_debug.c \
 	$(BDB_TOP)/src/log/log_get.c \
+	$(BDB_TOP)/src/log/log_handoff_trace.c \
 	$(BDB_TOP)/src/log/log_method.c \
 	$(BDB_TOP)/src/log/log_print.c \
 	$(BDB_TOP)/src/log/log_put.c \
@@ -232,6 +233,7 @@ LOCAL_SRC_FILES := \
 	$(BDB_TOP)/src/mp/mp_sync.c \
 	$(BDB_TOP)/src/mp/mp_trickle.c \
 	$(BDB_TOP)/src/mutex/mut_alloc.c \
+	$(BDB_TOP)/src/mutex/mut_order.c \
 	$(BDB_TOP)/src/mutex/mut_failchk.c \
 	$(BDB_TOP)/src/mutex/mut_method.c \
 	$(BDB_TOP)/src/mutex/mut_region.c \
@@ -239,9 +241,16 @@ LOCAL_SRC_FILES := \
 	$(BDB_TOP)/src/mutex/mut_tas.c \
 	$(BDB_TOP)/src/os/os_abort.c \
 	$(BDB_TOP)/src/os/os_abs.c \
+	$(BDB_TOP)/src/os/os_aio.c \
+	$(BDB_TOP)/src/os/os_aio_uring.c \
+	$(BDB_TOP)/src/os/os_aio_posix.c \
+	$(BDB_TOP)/src/os/os_aio_kqueue.c \
+	$(BDB_TOP)/src/os/os_aio_pool.c \
+	$(BDB_TOP)/src/os/os_aio_iocp.c \
 	$(BDB_TOP)/src/os/os_alloc.c \
 	$(BDB_TOP)/src/os/os_clock.c \
 	$(BDB_TOP)/src/os/os_config.c \
+	$(BDB_TOP)/src/os/os_csprng.c \
 	$(BDB_TOP)/src/os/os_cpu.c \
 	$(BDB_TOP)/src/os/os_ctime.c \
 	$(BDB_TOP)/src/os/os_dir.c \

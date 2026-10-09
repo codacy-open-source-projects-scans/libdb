@@ -11,6 +11,7 @@
 #include "db_int.h"
 #include "dbinc/lock.h"
 #include "dbinc/log.h"
+#include "dbinc/txn.h"
 
 static int __lock_freelocker_int
     __P((DB_LOCKTAB *, DB_LOCKREGION *, DB_LOCKER *, int));
@@ -68,7 +69,20 @@ __lock_id(env, idp, lkp)
 	id = DB_LOCK_INVALIDID;
 	lk = NULL;
 
-	LOCK_LOCKERS(env, region);
+	/*
+	 * The id counter and the wraparound rebuild live under the allocation
+	 * latch (stripe 0).  The rebuild walks region->lockers, which the
+	 * bucket stripes do not cover, so it escalates to all stripes; the
+	 * common path takes stripe 0 plus the one bucket the new locker hashes
+	 * to.  Race-freedom for lock_id/cur_maxid: every read and every write
+	 * of either counter in this function happens with stripe 0 held, and
+	 * stripe 0 is held continuously from before the wraparound test to
+	 * after the increment, so no concurrent bump can slip between the test
+	 * and the ++.  __lock_id_set is the only other writer and is
+	 * documented single-threaded test-only; lock_stat reads them under
+	 * LOCK_REGION_LOCK for reporting, where a torn read is harmless.
+	 */
+	LOCK_LOCKER_ALLOC(env, region);
 
 	/*
 	 * Allocate a new lock id.  If we wrap around then we find the minimum
@@ -82,9 +96,18 @@ __lock_id(env, idp, lkp)
 	    region->cur_maxid != DB_LOCK_MAXID)
 		region->lock_id = DB_LOCK_INVALIDID;
 	if (region->lock_id == region->cur_maxid) {
+		/*
+		 * Wraparound: walk every locker.  region->lockers spans all
+		 * buckets, so take the remaining stripes and hold the whole
+		 * table for the rebuild.  Rare by construction (once per 2^31
+		 * ids).
+		 */
+		LOCK_LOCKERS_REST(env, region);
 		if ((ret = __os_malloc(env,
-		    sizeof(u_int32_t) * region->nlockers, &ids)) != 0)
+		    sizeof(u_int32_t) * region->nlockers, &ids)) != 0) {
+			UNLOCK_LOCKERS_REST(env, region);
 			goto err;
+		}
 		nids = 0;
 		SH_TAILQ_FOREACH(lk, &region->lockers, ulinks, __db_locker)
 			ids[nids++] = lk->id;
@@ -94,13 +117,33 @@ __lock_id(env, idp, lkp)
 			__db_idspace(ids, nids,
 			    &region->lock_id, &region->cur_maxid);
 		__os_free(env, ids);
+		UNLOCK_LOCKERS_REST(env, region);
 	}
 	id = ++region->lock_id;
 
-	/* Allocate a locker for this id. */
-	ret = __lock_getlocker_int(lt, id, 1, &lk);
+	/*
+	 * Allocate a locker for this id.  __lock_getlocker_int inserts into
+	 * locker_tab[id's bucket] and pops region->free_lockers, so the bucket
+	 * stripe plus the allocation latch (held) is exactly the coverage it
+	 * needs -- UNLESS the free list is empty, in which case it refills from
+	 * the region, which drops and retakes the locker latches and touches
+	 * state no bucket stripe covers.  Deciding here, with stripe 0 held
+	 * across both the test and the call, is what makes the choice sound:
+	 * every consumer of free_lockers holds stripe 0, so a list observed
+	 * non-empty cannot go empty underneath us, and the refill branch inside
+	 * __lock_getlocker_int is then unreachable.
+	 */
+	if (SH_TAILQ_FIRST(&region->free_lockers, __db_locker) == NULL) {
+		LOCK_LOCKERS_REST(env, region);
+		ret = __lock_getlocker_int(lt, id, 1, &lk);
+		UNLOCK_LOCKERS_REST(env, region);
+	} else {
+		LOCK_LOCKER_BUCKET(env, region, id);
+		ret = __lock_getlocker_int(lt, id, 1, &lk);
+		UNLOCK_LOCKER_BUCKET(env, region, id);
+	}
 
-err:	UNLOCK_LOCKERS(env, region);
+err:	UNLOCK_LOCKER_ALLOC(env, region);
 
 	if (idp != NULL)
 		*idp = id;
@@ -270,9 +313,25 @@ __lock_getlocker(lt, locker, create, retp)
 	env = lt->env;
 	region = lt->reginfo.primary;
 
-	LOCK_LOCKERS(env, region);
-	ret = __lock_getlocker_int(lt, locker, create, retp);
-	UNLOCK_LOCKERS(env, region);
+	/*
+	 * A create may have to refill the locker free list, which drops the
+	 * locker latches and touches region-wide state; a lookup never does.
+	 * See __lock_id for why testing the free list under the allocation
+	 * latch makes the single-bucket choice sound.  This is the hot
+	 * txn_begin path (txn.c:588): 2 latches per call rather than 64.
+	 */
+	LOCK_LOCKER_ALLOC(env, region);
+	if (create &&
+	    SH_TAILQ_FIRST(&region->free_lockers, __db_locker) == NULL) {
+		LOCK_LOCKERS_REST(env, region);
+		ret = __lock_getlocker_int(lt, locker, create, retp);
+		UNLOCK_LOCKERS_REST(env, region);
+	} else {
+		LOCK_LOCKER_BUCKET(env, region, locker);
+		ret = __lock_getlocker_int(lt, locker, create, retp);
+		UNLOCK_LOCKER_BUCKET(env, region, locker);
+	}
+	UNLOCK_LOCKER_ALLOC(env, region);
 
 	return (ret);
 }
@@ -329,6 +388,14 @@ __lock_getlocker_int(lt, locker, create, retp)
 			 * we could deadlock.  When creating a locker
 			 * there is no race since the id allocation
 			 * is synchronized.
+			 *
+			 * This branch releases and retakes ALL stripes, so
+			 * every caller that can reach it must hold all of
+			 * them.  The single-bucket callers guarantee that by
+			 * testing free_lockers under the allocation latch
+			 * first (see __lock_id, __lock_getlocker) and
+			 * escalating when it is empty, which is the only way
+			 * to get here.
 			 */
 			UNLOCK_LOCKERS(env, region);
 			LOCK_REGION_LOCK(env);
@@ -337,20 +404,30 @@ __lock_getlocker_int(lt, locker, create, retp)
 			 * allocate as much as possible.
 			 */
 			F_SET(&lt->reginfo, REGION_TRACKED);
+			/*
+			 * Try to allocate nlockers entries; on failure halve the
+			 * request and retry, down to zero.  The halving assignment
+			 * (nlockers >>= 1) is essential: without it the loop either
+			 * spins on the same failing size or breaks with sh_locker
+			 * still NULL while nlockers is non-zero -- the insert loop
+			 * below would then dereference a NULL sh_locker.  When the
+			 * request cannot be satisfied at all, nlockers reaches 0 and
+			 * we take the __lock_nomem path before touching sh_locker.
+			 */
 			while (__env_alloc(&lt->reginfo, nlockers *
 			    sizeof(struct __db_locker), &sh_locker) != 0)
-				if ((nlockers >> 1) == 0)
+				if ((nlockers >>= 1) == 0)
 					break;
 			F_CLR(&lt->reginfo, REGION_TRACKED);
 			LOCK_REGION_UNLOCK(lt->env);
 			LOCK_LOCKERS(env, region);
+			if (nlockers == 0)
+				return (__lock_nomem(env, "locker entries"));
 			for (i = 0; i < nlockers; i++) {
 				SH_TAILQ_INSERT_HEAD(&region->free_lockers,
 				    sh_locker, links, __db_locker);
 				sh_locker++;
 			}
-			if (nlockers == 0)
-				return (__lock_nomem(env, "locker entries"));
 			region->stat.st_lockers += nlockers;
 			sh_locker = SH_TAILQ_FIRST(
 			    &region->free_lockers, __db_locker);
@@ -370,6 +447,7 @@ __lock_getlocker_int(lt, locker, create, retp)
 		    env->dbenv, &sh_locker->pid, &sh_locker->tid);
 		sh_locker->mtx_locker = mutex;
 		sh_locker->dd_id = 0;
+		sh_locker->td_off = INVALID_ROFF;	/* SSI: set by txn layer. */
 		sh_locker->master_locker = INVALID_ROFF;
 		sh_locker->parent_locker = INVALID_ROFF;
 		SH_LIST_INIT(&sh_locker->child_locker);
@@ -489,6 +567,24 @@ __lock_freelocker_int(lt, region, sh_locker, reallyfree)
 		return (EINVAL);
 	}
 
+	/*
+	 * SSI: a committed snapshot-safe reader's persisted SIREAD markers stay
+	 * on their objects' sireaders lists (detached from heldby) and still
+	 * reference this locker via lp->holder.  Freeing the locker while any
+	 * such marker exists is a use-after-free when the GC (or a WRITE
+	 * acquirer) later dereferences LOCK_HOLDER(marker).  The per-detail
+	 * si_ref counts exactly those markers and is atomic, so it is the
+	 * race-free guard (nlocks is decremented under the object partition
+	 * mutex but read here under LOCK_LOCKERS -- a cross-domain race).
+	 * Defer while markers remain; flag DB_LOCKER_FREED so __lock_sicleanup
+	 * reclaims the locker once the last marker is gone.
+	 */
+	if (sh_locker->td_off != INVALID_ROFF &&
+	    atomic_read(&LOCKER_TD(env, sh_locker)->si_ref) != 0) {
+		F_SET(sh_locker, DB_LOCKER_FREED);
+		return (0);
+	}
+
 	/* If this is part of a family, we must fix up its links. */
 	if (sh_locker->master_locker != INVALID_ROFF) {
 		SH_LIST_REMOVE(sh_locker, child_link, __db_locker);
@@ -515,6 +611,65 @@ __lock_freelocker_int(lt, region, sh_locker, reallyfree)
 }
 
 /*
+ * __lock_sireap_lockers --
+ *	Free committed-reader (SSI) lockers whose last SIREAD marker has been
+ *	reclaimed.  __lock_siclean_obj marks such a locker while holding the
+ *	object partition mutex, by clearing its td_off once the marker count
+ *	reaches zero; here, with no partition mutex held, we take LOCK_LOCKERS
+ *	and release the locker and its logical mutex.  Without this the
+ *	DB_LOCKER_FREED locker stayed allocated for the life of the environment,
+ *	so sequential read-only snapshot transactions eventually exhausted the
+ *	mutex region (DB_ENV->txn_begin returning ENOMEM).
+ *
+ *	This deliberately dereferences no TXN_DETAIL: mpool may free the detail
+ *	as soon as si_ref reaches zero, so the marker-count observation has to
+ *	happen (and does) in __lock_siclean_obj, not here.
+ *
+ * PUBLIC: int __lock_sireap_lockers __P((ENV *));
+ */
+int
+__lock_sireap_lockers(env)
+	ENV *env;
+{
+	DB_LOCKER *sh_locker, *next_locker;
+	DB_LOCKREGION *region;
+	DB_LOCKTAB *lt;
+	int ret;
+
+	if (!LOCKING_ON(env))
+		return (0);
+	lt = env->lk_handle;
+	region = lt->reginfo.primary;
+	ret = 0;
+
+	LOCK_LOCKERS(env, region);
+	for (sh_locker = SH_TAILQ_FIRST(&region->lockers, __db_locker);
+	    sh_locker != NULL; sh_locker = next_locker) {
+		next_locker = SH_TAILQ_NEXT(sh_locker, ulinks, __db_locker);
+		/*
+		 * (DB_LOCKER_FREED && td_off == INVALID_ROFF) is set only by
+		 * __lock_siclean_obj: a locker whose reclamation was deferred
+		 * for SIREAD markers that are now all gone.  A live locker never
+		 * carries DB_LOCKER_FREED, and a still-deferred one still has
+		 * its td_off.  heldby must be empty (__lock_sicommit detached
+		 * the markers, DB_LOCK_PUT_ALL released everything else) --
+		 * __lock_freelocker_int would return EINVAL rather than free a
+		 * locker with locks, so skip it instead of failing the sweep.
+		 */
+		if (!F_ISSET(sh_locker, DB_LOCKER_FREED) ||
+		    sh_locker->td_off != INVALID_ROFF ||
+		    !SH_LIST_EMPTY(&sh_locker->heldby))
+			continue;
+		if ((ret =
+		    __lock_freelocker_int(lt, region, sh_locker, 1)) != 0)
+			break;
+	}
+	UNLOCK_LOCKERS(env, region);
+
+	return (ret);
+}
+
+/*
  * __lock_freelocker
  *	Remove a locker its family from the hash table.
  *
@@ -537,12 +692,35 @@ __lock_freelocker(lt, sh_locker)
 	if (sh_locker == NULL)
 		return (0);
 
-	LOCK_LOCKERS(env, region);
-	ret = __lock_freelocker_int(lt, region, sh_locker, 1);
-	UNLOCK_LOCKERS(env, region);
+	/*
+	 * Hot path (txn.c:1916, every txn_end).  __lock_freelocker_int touches
+	 * this locker's own bucket chain plus the region-wide free/ulinks lists
+	 * and nlockers, so the allocation latch plus one bucket stripe covers
+	 * it -- EXCEPT for a locker in a transaction family, where it also
+	 * unlinks from the master's child_locker list, and the master lives in
+	 * some other bucket.  Escalate in that case.
+	 *
+	 * Reading master_locker/child_locker to make that decision is safe
+	 * under the allocation latch alone: both are written only by
+	 * __lock_addfamilylocker and __lock_freelocker_int, and both of those
+	 * hold stripe 0 (the former as part of LOCK_LOCKERS).
+	 */
+	LOCK_LOCKER_ALLOC(env, region);
+	if (sh_locker->master_locker != INVALID_ROFF ||
+	    !SH_LIST_EMPTY(&sh_locker->child_locker)) {
+		LOCK_LOCKERS_REST(env, region);
+		ret = __lock_freelocker_int(lt, region, sh_locker, 1);
+		UNLOCK_LOCKERS_REST(env, region);
+	} else {
+		LOCK_LOCKER_BUCKET(env, region, sh_locker->id);
+		ret = __lock_freelocker_int(lt, region, sh_locker, 1);
+		UNLOCK_LOCKER_BUCKET(env, region, sh_locker->id);
+	}
+	UNLOCK_LOCKER_ALLOC(env, region);
 
 	return (ret);
 }
+
 
 /*
  * __lock_familyremove

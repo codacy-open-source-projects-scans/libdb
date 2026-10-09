@@ -12,13 +12,20 @@
 #include "dbinc/crypto.h"
 #include "dbinc/hmac.h"
 #include "dbinc/log.h"
+#include "dbinc/log_handoff_trace.h"
 #include "dbinc/txn.h"
 #include "dbinc/db_page.h"
 #include "dbinc_auto/db_ext.h"
 
+#ifdef HAVE_DST
+#include "sim_inject.h"			/* DST planted-bug harness. */
+#include "sim_buggify.h"			/* DST buggify points. */
+#endif
+
 static int __log_encrypt_record __P((ENV *, DBT *, HDR *, u_int32_t));
 static int __log_file __P((ENV *, const DB_LSN *, char *, size_t));
 static int __log_fill __P((DB_LOG *, DB_LSN *, void *, u_int32_t));
+static int __log_write_direct __P((DB_LOG *, u_int8_t *, u_int32_t));
 static int __log_flush_commit __P((ENV *, const DB_LSN *, u_int32_t));
 static int __log_newfh __P((DB_LOG *, int));
 static int __log_put_next __P((ENV *,
@@ -304,6 +311,18 @@ __log_put(env, lsnp, udbt, flags)
 	 * If a flush is not needed, see if WRITE_NOSYNC was set and we
 	 * need to write out the log buffer.
 	 */
+#ifdef HAVE_DST
+	/*
+	 * BUGGIFY log.flush_now: force a synchronous log flush on a put
+	 * that would otherwise buffer.  Legal-but-pessimal: an EXTRA fsync
+	 * only makes more of the log durable sooner -- it can never lose or
+	 * reorder a record -- so correctness (and crash recovery) is
+	 * unchanged; it just exercises the flush path far more often than a
+	 * lazy WRNOSYNC workload would.
+	 */
+	if (DB_BUGGIFY(BUGGIFY_LOG_FLUSH_NOW))
+		LF_SET(DB_FLUSH);
+#endif
 	if (LF_ISSET(DB_FLUSH | DB_LOG_WRNOSYNC)) {
 		if (!lock_held) {
 			LOG_SYSTEM_LOCK(env);
@@ -465,6 +484,26 @@ __log_put_next(env, lsn, dbt, hdr, old_lsnp)
 		__log_set_version(env, DB_LOGVERSION);
 		adv_file = 1;
 	}
+
+#ifdef HAVE_DST
+	/*
+	 * BUGGIFY log.newfile_early: roll over to a fresh log file before
+	 * the current one is actually full, to stress log-file switching
+	 * and the archive/rollover path (which a steady workload hits only
+	 * every few MB).  Legal-but-pessimal: a rollover is exactly what
+	 * the engine does when a file fills; forcing it early just yields
+	 * more, smaller files -- recovery and archiving handle any number
+	 * of files, so the result is unchanged.  Gated on the file already
+	 * being at least half full (offset*2 > log_size) so files stay a
+	 * bounded size (no one-record-per-file explosion that would swamp
+	 * the write-back crash model's fixed file table).
+	 */
+	if (!adv_file && lp->lsn.offset != 0 &&
+	    (u_int32_t)lp->lsn.offset * 2 > lp->log_size &&
+	    hdr->size + sizeof(LOGP) + dbt->size <= lp->log_nsize &&
+	    DB_BUGGIFY(BUGGIFY_LOG_NEWFILE_EARLY))
+		adv_file = 1;
+#endif
 
 	/*
 	 * If this information won't fit in the file, or if we're a
@@ -925,6 +964,32 @@ __log_flush_pp(dbenv, lsn)
 	    (lp)->s_lsn.offset > (lsnp)->offset))
 
 /*
+ * __log_group_commit_enabled --
+ *	Group commit (the leader/followers batching of commit-record flushes
+ *	in __log_flush_int) is on by default; setting DB_NO_GROUP_COMMIT in
+ *	the environment disables the waiter queue, so each committer performs
+ *	its own flush.  Read once, cached process-wide.
+ *
+ *	This exists to make the value of group commit measurable from a single
+ *	binary (A/B the same build with and without the variable) and to give
+ *	a bisect switch if the coordination is ever suspected in a bug.  It
+ *	does NOT weaken durability in either position: with the queue disabled
+ *	every committer flushes for itself, which is strictly more flushing,
+ *	and the "is my LSN durable" test at the top of the flush block is
+ *	unchanged.  Same reasoning and same shape as DB_NO_RSNAP in
+ *	src/btree/bt_search.c.
+ */
+static int
+__log_group_commit_enabled()
+{
+	static int cached = -1;
+
+	if (cached == -1)
+		cached = getenv("DB_NO_GROUP_COMMIT") != NULL ? 0 : 1;
+	return (cached);
+}
+
+/*
  * __log_flush --
  *	ENV->log_flush
  *
@@ -969,11 +1034,16 @@ __log_flush_int(dblp, lsnp, release)
 	size_t b_off;
 	u_int32_t ncommit, w_off;
 	int do_flush, first, ret;
+	DB_HOFF_DECL_WAIT;
+	DB_HOFF_DECL_ROUND;
 
 	env = dblp->env;
 	lp = dblp->reginfo.primary;
 	ncommit = 0;
 	ret = 0;
+#ifdef HAVE_HANDOFF_TRACE
+	__db_hoff_init();
+#endif
 
 	if (lp->db_log_inmemory) {
 		lp->s_lsn = lp->lsn;
@@ -1011,8 +1081,16 @@ __log_flush_int(dblp, lsnp, release)
 	/*
 	 * If a flush is in progress and we're allowed to do so, drop
 	 * the region lock and block waiting for the next flush.
+	 *
+	 * This is group commit: the thread that is already flushing acts as
+	 * the leader and, when its fsync completes, wakes every queued waiter
+	 * whose commit LSN that fsync made durable (the LOG_COMPARE against
+	 * lp->s_lsn in the wake pass below).  A waiter therefore only returns
+	 * success after the durable watermark has been observed to cover its
+	 * own LSN -- it never infers coverage from the mere fact that a flush
+	 * happened.
 	 */
-	if (release && lp->in_flush != 0) {
+	if (release && lp->in_flush != 0 && __log_group_commit_enabled()) {
 		if ((commit = SH_TAILQ_FIRST(
 		    &lp->free_commits, __db_commit)) == NULL) {
 			if ((ret = __env_alloc(&dblp->reginfo,
@@ -1041,10 +1119,13 @@ __log_flush_int(dblp, lsnp, release)
 		commit->lsn = flush_lsn;
 		SH_TAILQ_INSERT_HEAD(
 		    &lp->commits, commit, links, __db_commit);
+		DB_HOFF_WAIT_ENQUEUE(env, lp);
 		LOG_SYSTEM_UNLOCK(env);
 		/* Wait here for the in-progress flush to finish. */
 		MUTEX_LOCK(env, commit->mtx_txnwait);
+		DB_HOFF_WAIT_WOKEN(env);
 		LOG_SYSTEM_LOCK(env);
+		DB_HOFF_WAIT_DONE(env, lp);
 
 		lp->ncommit--;
 		/*
@@ -1059,8 +1140,41 @@ __log_flush_int(dblp, lsnp, release)
 		if (do_flush) {
 			lp->in_flush--;
 			flush_lsn = lp->t_lsn;
-		} else
+		} else if (ALREADY_FLUSHED(lp, &flush_lsn))
+			/*
+			 * We were woken as a follower of somebody else's
+			 * flush, and the durable watermark lp->s_lsn now
+			 * covers our own commit LSN, so our record is on
+			 * stable storage and we may report success.
+			 *
+			 * The waker only unlocks a waiter's mtx_txnwait after
+			 * testing that same coverage (the LOG_COMPARE against
+			 * lp->s_lsn in the wake pass at the end of this
+			 * function), and it does so holding the region lock,
+			 * which we have just reacquired.  s_lsn only ever
+			 * moves forward, so coverage once established cannot
+			 * be lost, and this test is expected to pass.
+			 *
+			 * We verify it rather than assume it.  This return is
+			 * the single place where a transaction whose commit
+			 * record might not be durable could be reported
+			 * committed, so a bug anywhere in the wake path would
+			 * become silent data loss instead of a detectable
+			 * failure.  Testing the watermark here makes the
+			 * durability of the return value depend only on
+			 * lp->s_lsn, never on having been woken correctly.
+			 */
 			return (0);
+		else {
+			/*
+			 * Unreachable by the argument above: we were woken
+			 * without the baton and without coverage.  Rather than
+			 * return a commit we cannot prove is durable, fall
+			 * through and flush for ourselves.  Loud in a
+			 * DIAGNOSTIC build, correct in any build.
+			 */
+			DB_ASSERT(env, ALREADY_FLUSHED(lp, &flush_lsn));
+		}
 	}
 
 	/*
@@ -1114,10 +1228,24 @@ flush:	MUTEX_LOCK(env, lp->mtx_flush);
 	w_off = lp->w_off;
 	f_lsn = lp->f_lsn;
 	lp->in_flush++;
+	DB_HOFF_LEAD_BEGIN(env);
 	if (release)
 		LOG_SYSTEM_UNLOCK(env);
 
 	/* Sync all writes to disk. */
+	DB_HOFF_FSYNC_BEGIN(env);
+#if defined(HAVE_DST)
+#if DB_DST_BUG(1)
+	/*
+	 * PLANTED BUG NODURABLE (DB_DST_INJECT_BUG=1): skip the log fsync
+	 * but still ack the commit as durable.  The write-back model's
+	 * durable frontier never advances past this record, so a crash
+	 * drops it -- and a commit the caller believes is durable is lost.
+	 * test_sim_crash_recover's "every committed txn survives" invariant
+	 * fires.  Compiled out of every normal build.
+	 */
+	ret = 0;
+#else
 	if ((ret = __os_fsync(env, dblp->lfhp)) != 0) {
 		MUTEX_UNLOCK(env, lp->mtx_flush);
 		if (release)
@@ -1125,6 +1253,16 @@ flush:	MUTEX_LOCK(env, lp->mtx_flush);
 		lp->in_flush--;
 		goto done;
 	}
+#endif
+#else
+	if ((ret = __os_fsync(env, dblp->lfhp)) != 0) {
+		MUTEX_UNLOCK(env, lp->mtx_flush);
+		if (release)
+			LOG_SYSTEM_LOCK(env);
+		lp->in_flush--;
+		goto done;
+	}
+#endif
 
 	/*
 	 * Set the last-synced LSN.
@@ -1134,6 +1272,7 @@ flush:	MUTEX_LOCK(env, lp->mtx_flush);
 	 * we can move up to write point since the first lsn is not
 	 * set for the new buffer.
 	 */
+	DB_HOFF_FSYNC_END(env);
 	lp->s_lsn = f_lsn;
 	if (b_off == 0)
 		lp->s_lsn.offset = w_off;
@@ -1159,6 +1298,7 @@ done:
 				SH_TAILQ_REMOVE(
 				    &lp->commits, commit, links, __db_commit);
 				ncommit++;
+				DB_HOFF_WOKE_ONE;
 			} else if (first == 1) {
 				F_SET(commit, DB_COMMIT_FLUSH);
 				MUTEX_UNLOCK(env, commit->mtx_txnwait);
@@ -1172,8 +1312,10 @@ done:
 				 */
 				lp->in_flush++;
 				first = 0;
+				DB_HOFF_BATON_ONE;
 			}
 	}
+	DB_HOFF_LEAD_END(env, lp);
 #ifdef HAVE_STATISTICS
 	if (lp->stat.st_maxcommitperflush < ncommit)
 		lp->stat.st_maxcommitperflush = ncommit;
@@ -1254,6 +1396,113 @@ __log_fill(dblp, lsn, addr, len)
 }
 
 /*
+ * __log_write_direct --
+ *	Write the log buffer through a descriptor opened O_DIRECT.
+ *
+ * O_DIRECT constrains all three of the buffer address, the file offset and the
+ * transfer length to be multiples of the device block size.  __log_write
+ * satisfies none of them: `addr' is either the region log buffer or a caller's
+ * record, `lp->w_off' is a byte-granular append frontier, and `len' is an
+ * arbitrary record length.  That is defect P3 -- under DB_LOG_DIRECT the first
+ * transactional DB->open failed EINVAL on a 1-byte and then a 131-byte write.
+ *
+ * We restage each write into a block-aligned window:
+ *
+ *	base = w_off rounded DOWN to a block, head = w_off - base
+ *
+ * and emit whole blocks covering [base, w_off + len).  The head bytes are the
+ * tail of a record a PREVIOUS write already placed in the file, so we read that
+ * leading block back and rewrite it byte-for-byte identically; the trailing
+ * partial block is zero-padded.
+ *
+ * Why the log stays readable:  the padding lies strictly beyond lp->w_off + len,
+ * ground the reader already treats as end-of-log, and which a log file is
+ * already zero/sparse over (__db_file_extend / DBLOG_ZERO preallocate it that
+ * way).  The next write re-covers it with real data.  LSN space is untouched:
+ * w_off still advances by exactly `len', so no offset, f_lsn, s_lsn or
+ * buffer-index arithmetic anywhere else changes meaning.
+ *
+ * Why durability is unchanged:  rewriting the leading block with identical
+ * bytes is what the buffered path already does -- the page cache writes back
+ * whole pages, so a page holding an already-fsync'd record is rewritten when
+ * the next record lands in it.  The only exposure is a torn sector, which is
+ * exactly what the per-record log checksum exists to detect and which makes the
+ * reader stop at that record.  Both __os_io error returns propagate.
+ *
+ * ponytail: one pwrite per block, so a flush larger than a block costs more I/O
+ * operations than the single unaligned write it replaces, and a write that does
+ * not start on a boundary costs one extra block read.  Caching the trailing
+ * partial block across calls would remove the read, but needs a field in DB_LOG,
+ * which __env_struct_sig hashes -- that would invalidate every existing
+ * environment for an optional flag.  Revisit if DB_LOG_DIRECT throughput
+ * matters more than on-disk compatibility.
+ */
+static int
+__log_write_direct(dblp, addr, len)
+	DB_LOG *dblp;
+	u_int8_t *addr;
+	u_int32_t len;
+{
+	ENV *env;
+	LOG *lp;
+	size_t nio;
+	u_int32_t base, head, n, off, total;
+	int ret;
+	u_int8_t *stage;
+	/* One block, plus the slack ALIGNP_INC needs to round the base up. */
+	u_int8_t stagebuf[2 * DB_LG_DIRECT_ALIGN];
+
+	env = dblp->env;
+	lp = dblp->reginfo.primary;
+	stage = ALIGNP_INC(stagebuf, DB_LG_DIRECT_ALIGN);
+
+	base = lp->w_off & ~(u_int32_t)(DB_LG_DIRECT_ALIGN - 1);
+	head = lp->w_off - base;
+	total = head + len;
+
+	/*
+	 * Recover the bytes of the leading block that precede our data.  An
+	 * earlier write put them there, so the file is at least w_off long; a
+	 * read that cannot reach w_off means the log was truncated under us,
+	 * and rewriting the block from stack garbage would destroy a durable
+	 * record.  Fail instead.
+	 */
+	if (head != 0) {
+		if ((ret = __os_io(env, DB_IO_READ, dblp->lfhp, 0, 0,
+		    base, DB_LG_DIRECT_ALIGN, stage, &nio)) != 0)
+			return (ret);
+		if (nio < (size_t)head) {
+			__db_errx(env,
+			    "Short read of the log block preceding offset %lu",
+			    (u_long)lp->w_off);
+			return (EIO);
+		}
+	}
+
+	for (off = 0; off < total; off += n) {
+		n = total - off;
+		if (n > DB_LG_DIRECT_ALIGN)
+			n = DB_LG_DIRECT_ALIGN;
+		/*
+		 * stage[0, head) already holds the recovered head bytes; every
+		 * later block starts on a boundary, so it is all payload.
+		 */
+		if (off == 0)
+			memcpy(stage + head, addr, n - head);
+		else
+			memcpy(stage, addr + (off - head), n);
+		/* Zero-pad a trailing partial block. */
+		if (n != DB_LG_DIRECT_ALIGN)
+			memset(stage + n, 0, DB_LG_DIRECT_ALIGN - n);
+		if ((ret = __os_io(env, DB_IO_WRITE, dblp->lfhp, 0, 0,
+		    base + off, DB_LG_DIRECT_ALIGN, stage, &nio)) != 0)
+			return (ret);
+	}
+
+	return (0);
+}
+
+/*
  * __log_write --
  *	Write the log buffer to disk.
  */
@@ -1292,11 +1541,18 @@ __log_write(dblp, addr, len)
 	 *
 	 * Ignore any error -- we may have run out of disk space, but that's no
 	 * reason to quit.
+	 *
+	 * Skipped under DBLOG_DIRECT: both helpers do byte- and buffer_size-
+	 * granular I/O that O_DIRECT rejects (the 1-byte __db_file_extend write
+	 * is the first EINVAL P3 reported).  The errors are already ignored, so
+	 * the only thing lost is the optimization -- but the syserr each failed
+	 * call logged named the wrong culprit on every log file creation.
 	 */
 #ifdef HAVE_FILESYSTEM_NOTZERO
-	if (lp->w_off == 0 && !__os_fs_notzero()) {
+	if (lp->w_off == 0 && !F_ISSET(dblp, DBLOG_DIRECT) &&
+	    !__os_fs_notzero()) {
 #else
-	if (lp->w_off == 0) {
+	if (lp->w_off == 0 && !F_ISSET(dblp, DBLOG_DIRECT)) {
 #endif
 		(void)__db_file_extend(env, dblp->lfhp, lp->log_size);
 		if (F_ISSET(dblp, DBLOG_ZERO))
@@ -1309,9 +1565,30 @@ __log_write(dblp, addr, len)
 	 * Seek to the offset in the file (someone may have written it
 	 * since we last did).
 	 */
-	if ((ret = __os_io(env, DB_IO_WRITE,
-	    dblp->lfhp, 0, 0, lp->w_off, len, addr, &nw)) != 0)
+	if ((ret = F_ISSET(dblp, DBLOG_DIRECT) ?
+	    __log_write_direct(dblp, addr, len) :
+	    __os_io(env, DB_IO_WRITE,
+	    dblp->lfhp, 0, 0, lp->w_off, len, addr, &nw)) != 0) {
+#if defined(HAVE_DST)
+#if DB_DST_BUG(8)
+		/*
+		 * PLANTED BUG LOGWRITEIGNORE (DB_DST_INJECT_BUG=8): swallow
+		 * the log write error (e.g. ENOSPC / EIO) and fall through as
+		 * if the record reached the file, advancing lp->w_off.  A
+		 * commit is then acked whose log bytes never persisted; after
+		 * a crash the record is gone.  test_sim_log_enospc's "an
+		 * acked commit whose log write failed must not silently
+		 * vanish" invariant fires.  Compiled out of every normal
+		 * build.
+		 */
+		ret = 0;
+#else
 		return (ret);
+#endif
+#else
+		return (ret);
+#endif
+	}
 
 	/* Reset the buffer offset and update the seek offset. */
 	lp->w_off += len;
@@ -1908,7 +2185,19 @@ __log_put_record_int(env, dbp, txnp, ret_lsnp,
 			} else {
 				LOGCOPY_32(env, bp, &dbt->size);
 				bp += sizeof(dbt->size);
-				memcpy(bp, dbt->data, dbt->size);
+				/*
+				 * A DBT may be non-NULL and still carry a NULL
+				 * data pointer when its size is 0 -- a caller
+				 * logging an empty record.  memcpy's arguments
+				 * are declared non-null regardless of the
+				 * length, so passing (NULL, 0) is undefined
+				 * behaviour even though no bytes move, and UBSan
+				 * reports it: "null pointer passed as argument
+				 * 2, which is declared to never be null".
+				 * Defect T5.
+				 */
+				if (dbt->size != 0)
+					memcpy(bp, dbt->data, dbt->size);
 			}
 			/* Process fields that need to be byte swapped. */
 			if (dbp != NULL && F_ISSET(dbp, DB_AM_SWAP)) {
@@ -1943,7 +2232,8 @@ __log_put_record_int(env, dbp, txnp, ret_lsnp,
 				LOGCOPY_32(env, bp, &header->size);
 				bp += sizeof(header->size);
 				pghdrstart = (PAGE *)bp;
-				memcpy(bp, header->data, header->size);
+				if (header->size != 0)
+					memcpy(bp, header->data, header->size);
 				if (has_data == 0 &&
 				    F_ISSET(dbp, DB_AM_SWAP) &&
 				    (ret = __db_pageswap(
@@ -1967,7 +2257,8 @@ __log_put_record_int(env, dbp, txnp, ret_lsnp,
 					return (ret);
 				LOGCOPY_32(env, bp, &data->size);
 				bp += sizeof(data->size);
-				memcpy(bp, data->data, data->size);
+				if (data->size != 0)
+					memcpy(bp, data->data, data->size);
 				if (F_ISSET(dbp, DB_AM_SWAP) &&
 				     F_ISSET(data, DB_DBT_APPMALLOC))
 					__os_free(env, data->data);

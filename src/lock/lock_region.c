@@ -17,18 +17,19 @@ static int  __lock_region_init __P((ENV *, DB_LOCKTAB *));
  * The conflict arrays are set up such that the row is the lock you are
  * holding and the column is the lock that is desired.
  */
-#define	DB_LOCK_RIW_N	9
+#define	DB_LOCK_RIW_N	10
 static const u_int8_t db_riw_conflicts[] = {
-/*         N   R   W   WT  IW  IR  RIW DR  WW */
-/*   N */  0,  0,  0,  0,  0,  0,  0,  0,  0,
-/*   R */  0,  0,  1,  0,  1,  0,  1,  0,  1,
-/*   W */  0,  1,  1,  1,  1,  1,  1,  1,  1,
-/*  WT */  0,  0,  0,  0,  0,  0,  0,  0,  0,
-/*  IW */  0,  1,  1,  0,  0,  0,  0,  1,  1,
-/*  IR */  0,  0,  1,  0,  0,  0,  0,  0,  1,
-/* RIW */  0,  1,  1,  0,  0,  0,  0,  1,  1,
-/*  DR */  0,  0,  1,  0,  1,  0,  1,  0,  0,
-/*  WW */  0,  1,  1,  0,  1,  1,  1,  0,  1
+/*         N   R   W   WT  IW  IR  RIW DR  WW  SI */
+/*   N */  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
+/*   R */  0,  0,  1,  0,  1,  0,  1,  0,  1,  0,
+/*   W */  0,  1,  1,  1,  1,  1,  1,  1,  1,  0,
+/*  WT */  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
+/*  IW */  0,  1,  1,  0,  0,  0,  0,  1,  1,  0,
+/*  IR */  0,  0,  1,  0,  0,  0,  0,  0,  1,  0,
+/* RIW */  0,  1,  1,  0,  0,  0,  0,  1,  1,  0,
+/*  DR */  0,  0,  1,  0,  1,  0,  1,  0,  0,  0,
+/*  WW */  0,  1,  1,  0,  1,  1,  1,  0,  1,  0,
+/*  SI */  0,  0,  0,  0,  0,  0,  0,  0,  0,  0
 };
 
 /*
@@ -192,6 +193,7 @@ __lock_region_init(env, lt)
 	}
 
 	region->need_dd = 0;
+	atomic_init(&region->nsireaders, 0);	/* SSI GC-trigger hint. */
 	timespecclear(&region->next_timeout);
 	region->detect = DB_LOCK_NORUN;
 	region->lk_timeout = dbenv->lk_timeout;
@@ -252,9 +254,19 @@ __lock_region_init(env, lt)
 	    env, MTX_LOCK_REGION, 0, &region->mtx_dd)) != 0)
 		return (ret);
 
-	if ((ret = __mutex_alloc(
-	    env, MTX_LOCK_REGION, 0, &region->mtx_lockers)) != 0)
-		return (ret);
+	/*
+	 * The locker hash table is guarded by a set of striped SHARED latches.
+	 * The hot lock-get path looks up an existing locker (a read-only hash
+	 * walk) and takes one stripe shared, so many cores resolve their
+	 * locker concurrently without contending on a single rwlock reader
+	 * count; locker create, free, the deadlock detector's locker-list
+	 * walk, failchk, and stat take all stripes exclusive.  This removes the
+	 * per-operation global serialization on lock_get/lock_put.
+	 */
+	for (i = 0; i < LOCK_LOCKER_STRIPES; i++)
+		if ((ret = __mutex_alloc(env, MTX_LOCK_REGION,
+		    DB_MUTEX_SHARED, &region->mtx_locker_stripe[i])) != 0)
+			return (ret);
 
 	/* Allocate room for the locker hash table and initialize it. */
 	if ((ret = __env_alloc(&lt->reginfo,

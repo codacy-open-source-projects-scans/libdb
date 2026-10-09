@@ -13,8 +13,9 @@ set serial_tests {rep002 rep005 rep016 rep020 rep022 rep026 rep031 rep063 \
     rep078 rep079 rep096 rep097}
 #set serial_tests {}
 
-set subs {auto_repmgr bigfile dead env fop lock log memp multi_repmgr \
-    mutex other_repmgr plat recd rep rsrc sdb sdbtest sec si test txn}
+set subs {auto_repmgr bigfile dead env fop lock log logverify memp multi_repmgr \
+    mutex other_repmgr plat recd rep rsrc sdb sdbtest sec si ssi statprint mvcc \
+    test txn}
 
 set test_names(bigfile)	[list bigfile001 bigfile002]
 set test_names(compact) [list test111 \
@@ -31,9 +32,11 @@ set test_names(fop)	[list fop001 fop002 fop003 fop004 fop005 fop006 \
 set test_names(init)	[list rep029 rep030 rep031 rep033 rep037 rep038 rep039\
     rep055 rep060 rep061 rep062 rep070 rep072 rep084 rep085 rep086 rep087 \
     rep089 rep098]
-set test_names(lock)    [list lock001 lock002 lock003 lock004 lock005 lock006]
+set test_names(lock)    [list lock001 lock002 lock003 lock004 lock005 lock006 \
+    lock007]
 set test_names(log)     [list log001 log002 log003 log004 log005 log006 \
     log007 log008 log009]
+set test_names(logverify) [list logverify001 logverify002]
 set test_names(memp)	[list memp001 memp002 memp003 memp004 memp005]
 set test_names(mutex)	[list mut001 mut002]
 set test_names(plat)	[list plat001]
@@ -79,6 +82,10 @@ set test_names(sdb)	[list sdb001 sdb002 sdb003 sdb004 sdb005 sdb006 \
 set test_names(sdbtest)	[list sdbtest001 sdbtest002]
 set test_names(sec)	[list sec001 sec002]
 set test_names(si)	[list si001 si002 si003 si004 si005 si006 si007 si008]
+set test_names(ssi)	[list ssi001 ssi002 ssi003 ssi004 ssi005 ssi006 ssi007 ssi008 ssi009 ssi010 ssi011]
+set test_names(statprint)	[list statprint001]
+set test_names(mvcc)	[list mvcc001]
+set test_names(bt_rsnap)	[list bt_rsnap001]
 set test_names(test)	[list test001 test002 test003 test004 test005 \
     test006 test007 test008 test009 test010 test011 test012 test013 test014 \
     test015 test016 test017 test018 test019 test020 test021 test022 test023 \
@@ -94,7 +101,7 @@ set test_names(test)	[list test001 test002 test003 test004 test005 \
     test109 test110 test111 test112 test113 test114 test115 test116 test117 \
     test119 test120 test121 test122 test123 test124 test125 test126 test127 \
     test128 test129 test130 test131 test132 test133 test134 test135 test136 \
-    test137 test138 test139 test140 test141 test142]
+    test137 test138 test139 test140 test141 test142 test143]
 
 set test_names(txn)	[list txn001 txn002 txn003 txn004 txn005 txn006 \
     txn007 txn008 txn009 txn010 txn011 txn012 txn013 txn014]

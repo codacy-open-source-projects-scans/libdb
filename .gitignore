@@ -1,2 +1,52 @@
 build_unix/**
+build_asan/**
+build_asan_gate/**
 compile_commands.json
+test/tcl/tclIndex
+
+# DST scenario scratch env dirs (created by test_sim_* wherever they run)
+TESTDIR_sim_*/
+test/sim/TESTDIR_sim_*/
+
+# Test-tier build dirs and scratch env dirs (test/isolation, test/soak,
+# test/lockmatrix -- each run.sh builds into ./build and each driver creates
+# its scratch environments beside the binary)
+test/isolation/build/
+test/soak/build/
+test/lockmatrix/build/
+ISODIR.*/
+SOAKDIR.*/
+LOCKDIR/
+build_dst/**
+
+# Meson/Ninja out-of-tree build dirs
+build-meson/
+build/
+build-android/
+build-android.cross.txt
+
+# nix build output symlink
+/result
+
+# agent working notes (audits, status, scratch design) — not product docs
+.agents/
+.agent/
+
+# prototype build artifact
+rfc/0001/test_adaptive
+
+# benchmark driver binaries (built from test/bench/*.c)
+test/bench/scale_bench
+test/bench/scale_iso
+test/bench/lock_bench
+test/bench/tproc_c
+test/bench/tproc_b
+test/bench/tproc_h
+test/bench/ssi_abort_bench
+
+# Generated documentation (docs_src/build.py output)
+docs-build/
+docs_src/**/__pycache__/
+rfc/0001/test_adaptive
+test_adaptive
+test/.results/

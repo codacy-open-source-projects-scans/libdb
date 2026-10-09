@@ -16,6 +16,36 @@ extern "C" {
 #define	DB_LOCK_DEFAULT_N	1000	/* Default # of locks in region. */
 
 /*
+ * SI_CLEANUP_TRIGGER_DIV --
+ *	The committed-reader SIREAD marker sweep (__lock_sicleanup) fires from
+ *	txn_begin when live markers (region->nsireaders) exceed
+ *	st_objects / SI_CLEANUP_TRIGGER_DIV.  This makes the marker/locker/detail
+ *	footprint a bounded sawtooth whose ceiling is that fraction of the
+ *	lock-object table, independent of the transaction count -- the mechanism
+ *	that keeps a long-lived, no-checkpoint read-only SSI workload from
+ *	exhausting the lock region (issue #137).
+ *	8 was chosen over 2 empirically: it lowers the steady state ~4x and also
+ *	speeds the common path (shorter sireaders lists, smaller sweeps).
+ *
+ *	Defined here rather than in txn.c because it is a property of the lock
+ *	region, and DB_ENV->lock_stat_print reports the ceiling it implies as the
+ *	operator-facing bound on the SIREAD marker population.  One definition,
+ *	so the documented bound cannot drift from the trigger that enforces it.
+ */
+#define	SI_CLEANUP_TRIGGER_DIV	8
+
+/*
+ * Number of striped shared latches guarding the locker hash table.  A power
+ * of two so the stripe index is a mask of the bucket index.  Readers (the
+ * lock-get hot path) take one stripe shared; a writer takes one stripe
+ * exclusive plus stripe 0, which doubles as the locker allocation latch (see
+ * the LOCK_LOCKERS block below).  Sized to comfortably exceed common core
+ * counts so the per-operation reader-count atomics rarely share a cache line.
+ */
+#define	LOCK_LOCKER_STRIPES	64
+#define	LOCK_LOCKER_STRIPE(id)	((id) & (LOCK_LOCKER_STRIPES - 1))
+
+/*
  * The locker id space is divided between the transaction manager and the lock
  * manager.  Lock IDs start at 1 and go to DB_LOCK_MAXID.  Txn IDs start at
  * DB_LOCK_MAXID + 1 and go up to TXN_MAXIMUM.
@@ -70,7 +100,18 @@ typedef struct __db_lockregion { /* SHARED */
 	u_int32_t	detect;		/* run dd on every conflict */
 	db_timespec	next_timeout;	/* next time to expire a lock */
 	db_mutex_t	mtx_dd;		/* mutex for lock object dd list. */
-	db_mutex_t	mtx_lockers;	/* mutex for locker allocation. */
+	/*
+	 * Striped shared latches over the locker hash table.  The lock-get hot
+	 * path read-locks one stripe (chosen by the locker's BUCKET index) so
+	 * the per-operation reader-count atomics spread across
+	 * LOCK_LOCKER_STRIPES cache lines instead of contending on a single
+	 * rwlock counter.  A locker create/free takes its one bucket stripe
+	 * exclusive plus stripe 0; stripe 0 is also the allocation latch for
+	 * free_lockers/lockers/nlockers/lock_id, and the representative mutex
+	 * for wait-time statistics.  Only the whole-table walks (deadlock
+	 * detector, failchk, stat) still lock all stripes exclusive.
+	 */
+	db_mutex_t	mtx_locker_stripe[LOCK_LOCKER_STRIPES];
 	SH_TAILQ_HEAD(__dobj) dd_objs;	/* objects with waiters */
 					/* free locker header */
         roff_t          locker_mem_off; /* block memory for lockers */
@@ -93,6 +134,14 @@ typedef struct __db_lockregion { /* SHARED */
 	u_int32_t	lock_id;	/* Current lock(er) id to allocate. */
 	u_int32_t	cur_maxid;	/* Current max lock(er) id. */
 	u_int32_t	nlockers;	/* Current number of lockers. */
+	db_atomic_t	nsireaders;	/* SSI: approximate count of live SIREAD
+					   markers held by committed readers,
+					   used only to trigger best-effort GC
+					   (__lock_sicleanup) before the count
+					   grows unbounded between checkpoints.
+					   Atomic: inc/dec happen under different
+					   partition mutexes.  Not required to be
+					   exact. */
 	int32_t		nmodes;		/* Number of modes in conflict table. */
 	DB_LOCK_STAT	stat;		/* stats about locking. */
 } DB_LOCKREGION;
@@ -119,6 +168,7 @@ typedef struct __db_lockobj { /* SHARED */
 	SH_TAILQ_ENTRY dd_links;	/* Links for dd list. */
 	SH_TAILQ_HEAD(__waitl) waiters;	/* List of waiting locks. */
 	SH_TAILQ_HEAD(__holdl) holders;	/* List of held locks. */
+	SH_TAILQ_HEAD(__sil) sireaders;	/* List of SSI snapshot readers. */
 					/* Declare room in the object to hold
 					 * typical DB lock structures so that
 					 * we do not have to allocate them from
@@ -135,6 +185,8 @@ struct __db_locker { /* SHARED */
 	pid_t pid;			/* Process owning locker ID */
 	db_threadid_t tid;		/* Thread owning locker ID */
 	db_mutex_t mtx_locker;		/* Mutex to block on. */
+
+	roff_t	td_off;			/* SSI: TXN_DETAIL offset of locker. */
 
 	u_int32_t dd_id;		/* Deadlock detector id. */
 
@@ -163,6 +215,7 @@ struct __db_locker { /* SHARED */
 #define	DB_LOCKER_TIMEOUT	0x0004	/* Has timeout set. */
 #define	DB_LOCKER_FAMILY_LOCKER 0x0008	/* Part of a family of lockers. */
 #define	DB_LOCKER_HANDLE_LOCKER 0x0010	/* Not associated with a thread. */
+#define	DB_LOCKER_FREED		0x0020	/* SSI: freed, kept for SIREAD locks. */
 	u_int32_t flags;
 };
 
@@ -236,6 +289,25 @@ struct __db_lock { /* SHARED */
 };
 
 /*
+ * Serializable Snapshot Isolation (SSI) helpers.
+ *
+ * A locker is linked to its transaction detail via td_off so the lock layer
+ * can read MVCC snapshot LSNs (read_lsn / visible_lsn) when reasoning about
+ * rw-antidependencies recorded by SIREAD locks.
+ */
+#define	LOCKER_TD(env, lockerp)						\
+    ((TXN_DETAIL *)R_ADDR(&(env)->tx_handle->reginfo, (lockerp)->td_off))
+
+#define	LOCK_HOLDER(env, lp)						\
+    ((DB_LOCKER *)R_ADDR(&(env)->lk_handle->reginfo, (lp)->holder))
+
+#define	LOCK_OWNER(env, lp)		LOCKER_TD(env, LOCK_HOLDER(env, lp))
+
+#define	LOCK_READLSN(env, lp)		(LOCK_OWNER(env, lp)->read_lsn)
+
+#define	LOCK_COMMITLSN(env, lp)		(LOCK_OWNER(env, lp)->visible_lsn)
+
+/*
  * Flag values for __lock_put_internal:
  * DB_LOCK_DOALL:     Unlock all references in this lock (instead of only 1).
  * DB_LOCK_FREE:      Free the lock (used in checklocker).
@@ -246,6 +318,7 @@ struct __db_lock { /* SHARED */
  * we pass some of those around.
  */
 #define	DB_LOCK_DOALL		0x010000
+#define	DB_LOCK_SNAPSHOT_SAFE	0x020000	/* SSI: snapshot-safe acquire. */
 #define	DB_LOCK_FREE		0x040000
 #define	DB_LOCK_NOPROMOTE	0x080000
 #define	DB_LOCK_UNLINK		0x100000
@@ -303,10 +376,116 @@ struct __db_lock { /* SHARED */
 	MUTEX_LOCK(env, (region)->mtx_dd)
 #define	UNLOCK_DD(env, region)						\
 	MUTEX_UNLOCK(env, (region)->mtx_dd)
-#define	LOCK_LOCKERS(env, region)					\
-	MUTEX_LOCK(env, (region)->mtx_lockers)
-#define	UNLOCK_LOCKERS(env, region)					\
-	MUTEX_UNLOCK(env, (region)->mtx_lockers)
+/*
+ * The locker hash table is guarded by a set of striped shared latches
+ * (mtx_locker_stripe[]).  Two distinct roles are multiplexed onto that array:
+ *
+ *  1. mtx_locker_stripe[0] is the LOCKER ALLOCATION latch.  It guards the
+ *     region-wide state that has no per-bucket home: the free_lockers list,
+ *     the `lockers' (ulinks) list every full-table walk uses, nlockers /
+ *     stat.st_lockers, and the lock_id / cur_maxid id counters.
+ *  2. mtx_locker_stripe[LOCK_LOCKER_STRIPE(indx)] owns the locker_tab[indx]
+ *     bucket chains that map onto it.  Readers take it shared, writers take
+ *     it exclusive.
+ *
+ * The stripe is keyed on the BUCKET INDEX, not on the locker id.  That is not
+ * cosmetic: locker_t_size is a prime (__db_tablesize), so ids that differ by
+ * locker_t_size share a bucket while landing in different id-keyed stripes
+ * (id 1 and id 1 + 1031 with the default table).  An id-keyed stripe therefore
+ * does not own the chain its holder walks, and two writers could corrupt one
+ * chain concurrently.  Keying on the bucket makes a stripe the sole owner of
+ * every chain it covers.
+ *
+ * LOCK ORDER.  Stripe 0 is always acquired FIRST and released LAST; a bucket
+ * stripe is nested inside it, and no path ever holds two different bucket
+ * stripes.  That makes the order total and deadlock-free.  LOCK_LOCKERS takes
+ * all stripes ascending from 0, so it is a superset consistent with the same
+ * order.  Because bucket 0's stripe IS stripe 0, LOCK_LOCKER_BUCKET skips the
+ * nested acquire when they coincide (the latches are not recursive).  One
+ * consequence is deliberate and cheap: a READER whose bucket happens to map
+ * onto stripe 0 takes stripe 0 shared, so it blocks behind any writer
+ * anywhere.  That is 1/LOCK_LOCKER_STRIPES of readers, and it is the price of
+ * not adding a dedicated allocation mutex -- a new db_mutex_t in
+ * __db_lockregion would change the environment signature (env/env_sig.c
+ * hashes this struct) and so break compatibility with existing regions.
+ *
+ * LOCK_LOCKERS/UNLOCK_LOCKERS keep their original meaning: mutual exclusion of
+ * the whole locker table, for paths that walk every bucket or touch more than
+ * one locker's chain.  RDLOCK_LOCKER is the shared single-bucket read path;
+ * LOCK_LOCKER_ALLOC + LOCK_LOCKER_BUCKET is the exclusive single-bucket write
+ * path, which is what locker create and locker free need.
+ */
+/*
+ * Bucket index and bucket-keyed stripe index for a locker id.  (Expands
+ * __lock_locker_hash, defined below -- macro bodies are substituted at the use
+ * site, all of which are in .c files.)
+ */
+#define	LOCK_LOCKER_NDX(region, id)					\
+	(__lock_locker_hash(id) % (region)->locker_t_size)
+#define	LOCK_LOCKER_ID_STRIPE(region, id)				\
+	LOCK_LOCKER_STRIPE(LOCK_LOCKER_NDX(region, id))
+
+#define	RDLOCK_LOCKER(env, region, id)					\
+	MUTEX_READLOCK(env,						\
+	    (region)->mtx_locker_stripe[LOCK_LOCKER_ID_STRIPE(region, id)])
+#define	RDUNLOCK_LOCKER(env, region, id)				\
+	MUTEX_UNLOCK(env,						\
+	    (region)->mtx_locker_stripe[LOCK_LOCKER_ID_STRIPE(region, id)])
+
+/*
+ * The allocation latch on its own, for callers that touch only the region-wide
+ * locker state (the id counters, the free list, the ulinks list) and no bucket
+ * chain -- or that must hold it before the bucket is even known.
+ */
+#define	LOCK_LOCKER_ALLOC(env, region)					\
+	MUTEX_LOCK(env, (region)->mtx_locker_stripe[0])
+#define	UNLOCK_LOCKER_ALLOC(env, region)				\
+	MUTEX_UNLOCK(env, (region)->mtx_locker_stripe[0])
+
+/*
+ * One locker's bucket stripe, exclusive, nested inside the allocation latch.
+ * Skipped when the bucket maps onto stripe 0, which the caller already holds:
+ * these latches are not recursive.
+ */
+#define	LOCK_LOCKER_BUCKET(env, region, id) do {			\
+	u_int32_t __bs = LOCK_LOCKER_ID_STRIPE(region, id);		\
+	if (__bs != 0)							\
+		MUTEX_LOCK(env, (region)->mtx_locker_stripe[__bs]);	\
+} while (0)
+#define	UNLOCK_LOCKER_BUCKET(env, region, id) do {			\
+	u_int32_t __bs = LOCK_LOCKER_ID_STRIPE(region, id);		\
+	if (__bs != 0)							\
+		MUTEX_UNLOCK(env, (region)->mtx_locker_stripe[__bs]);	\
+} while (0)
+
+#define	LOCK_LOCKERS(env, region) do {					\
+	u_int32_t __s;							\
+	for (__s = 0; __s < LOCK_LOCKER_STRIPES; __s++)			\
+		MUTEX_LOCK(env, (region)->mtx_locker_stripe[__s]);	\
+} while (0)
+#define	UNLOCK_LOCKERS(env, region) do {				\
+	u_int32_t __s;							\
+	for (__s = LOCK_LOCKER_STRIPES; __s-- > 0; )			\
+		MUTEX_UNLOCK(env, (region)->mtx_locker_stripe[__s]);	\
+} while (0)
+
+/*
+ * Escalation from the allocation latch to the whole table: stripes 1..N-1,
+ * taken ascending while stripe 0 is already held, so the resulting hold is
+ * exactly LOCK_LOCKERS and acquired in the same total order.  Used by the
+ * single-bucket writers when they discover they need more than one bucket
+ * (a free-list refill, or a locker with transaction-family links).
+ */
+#define	LOCK_LOCKERS_REST(env, region) do {				\
+	u_int32_t __s;							\
+	for (__s = 1; __s < LOCK_LOCKER_STRIPES; __s++)			\
+		MUTEX_LOCK(env, (region)->mtx_locker_stripe[__s]);	\
+} while (0)
+#define	UNLOCK_LOCKERS_REST(env, region) do {				\
+	u_int32_t __s;							\
+	for (__s = LOCK_LOCKER_STRIPES; __s-- > 1; )			\
+		MUTEX_UNLOCK(env, (region)->mtx_locker_stripe[__s]);	\
+} while (0)
 
 /*
  * __lock_locker_hash --

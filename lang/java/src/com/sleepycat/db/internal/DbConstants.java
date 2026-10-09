@@ -65,7 +65,6 @@ public interface DbConstants
     int DB_GROUP_CREATOR = 0x00000002;
     int DB_HASH = 2;
     int DB_HEAP = 6;
-    int DB_HEAP_FULL = -30996;
     int DB_HOTBACKUP_IN_PROGRESS = 0x00000800;
     int DB_IGNORE_LEASE = 0x00001000;
     int DB_IMMUTABLE_KEY = 0x00000002;
@@ -229,6 +228,7 @@ public interface DbConstants
     int DB_TXN_NOT_DURABLE = 0x00000004;
     int DB_TXN_NOWAIT = 0x00000002;
     int DB_TXN_PRINT = 7;
+    int DB_TXN_SERIALIZABLE = 0x00200000;
     int DB_TXN_SNAPSHOT = 0x00000004;
     int DB_TXN_SYNC = 0x00000008;
     int DB_TXN_TOKEN_SIZE = 20;
@@ -256,9 +256,9 @@ public interface DbConstants
     int DB_VERB_REP_TEST = 0x00008000;
     int DB_VERB_WAITSFOR = 0x00010000;
     int DB_VERIFY = 0x00000002;
-    int DB_VERSION_MAJOR = 5;
-    int DB_VERSION_MINOR = 3;
-    int DB_VERSION_PATCH = 28;
+    int DB_VERSION_MAJOR = 2026;
+    int DB_VERSION_MINOR = 0;
+    int DB_VERSION_PATCH = 9;
     int DB_WRITECURSOR = 0x00000010;
     int DB_YIELDCPU = 0x00080000;
 }

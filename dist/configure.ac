@@ -110,6 +110,8 @@ AC_SUBST(DB_VERSION_MINOR)
 DB_VERSION_MINOR="__EDIT_DB_VERSION_MINOR__"
 AC_SUBST(DB_VERSION_PATCH)
 DB_VERSION_PATCH="__EDIT_DB_VERSION_PATCH__"
+AC_SUBST(DB_CALVER)
+DB_CALVER="__EDIT_DB_CALVER__"
 AC_SUBST(DB_VERSION_STRING)
 DB_VERSION_STRING='"__EDIT_DB_VERSION_STRING__"'
 AC_SUBST(DB_VERSION_FULL_STRING)
@@ -133,6 +135,45 @@ if test "$db_cv_diagnostic" = "yes"; then
 	AC_DEFINE(DIAGNOSTIC)
 	AH_TEMPLATE(DIAGNOSTIC,
     [Define to 1 if you want a version with run-time diagnostic checking.])
+fi
+
+# Deterministic Simulation Testing (DST): compile the sim fault-injection
+# core into the library and enable the guarded __os_* I/O hooks.  Additive
+# and DST-scoped: when off (the default) HAVE_DST is undefined, the hooks
+# vanish, and none of the test/sim sources are built, so a production build
+# is bit-for-bit the stock library.
+if test "$db_cv_dst" = "yes"; then
+	AC_DEFINE(HAVE_DST)
+	AH_TEMPLATE(HAVE_DST,
+    [Define to 1 to build with Deterministic Simulation Testing hooks.])
+	ADDITIONAL_OBJS="$ADDITIONAL_OBJS \$(SIM_OBJS)"
+	CPPFLAGS="$CPPFLAGS -I\$(topdir)/test/sim"
+fi
+
+# Malloc-failure injection (SQLite-style): compile the fault-injection
+# state into the library and enable the guarded __os_* allocation hook.
+# Additive and faultinject-scoped: when off (the default) HAVE_FAULT_INJECT
+# is undefined, the hook vanishes, fi_alloc.c is not built, and a
+# production build is bit-for-bit the stock library.
+if test "$db_cv_faultinject" = "yes"; then
+	AC_DEFINE(HAVE_FAULT_INJECT)
+	AH_TEMPLATE(HAVE_FAULT_INJECT,
+    [Define to 1 to build with SQLite-style malloc-failure injection hooks.])
+	ADDITIONAL_OBJS="$ADDITIONAL_OBJS \$(FI_OBJS)"
+	CPPFLAGS="$CPPFLAGS -I\$(topdir)/test/faultinject"
+fi
+
+# Group-commit handoff instrumentation (see src/dbinc/log_handoff_trace.h).
+# MEASUREMENT ONLY.  This adds a counter field to the shared LOG region, so it
+# changes the region layout and src/env/env_sig.c's signature -- which is the
+# point: an instrumented library will refuse to open a stock environment and
+# vice versa, rather than silently misreading it.  Never enable in production.
+# When off (the default) every macro in log_handoff_trace.h is a no-op, no
+# field is added, and the library is bit-for-bit the stock one.
+if test "$db_cv_handoff_trace" = "yes"; then
+	AC_DEFINE(HAVE_HANDOFF_TRACE)
+	AH_TEMPLATE(HAVE_HANDOFF_TRACE,
+    [Define to 1 to instrument the group-commit handoff in __log_flush_int.])
 fi
 if test "$db_cv_debug_rop" = "yes"; then
 	AC_DEFINE(DEBUG_ROP)
@@ -174,6 +215,74 @@ fi
 
 # Respect the environment LIBS settings
 LIBSO_LIBS="$LIBS"
+
+# Asynchronous I/O backends for the buffer pool (os_aio), selected at
+# runtime in preference order: io_uring (Linux) > IOCP (Windows) >
+# kqueue+aio (BSD) > POSIX aio (Solaris/illumos, macOS) > thread-pool
+# offload (last-resort fallback).  All are optional -- without any, os_aio
+# falls back to synchronous I/O.
+# io_uring is detected by default where it exists, but it must be possible to
+# decline it: linking it adds a hard DT_NEEDED liburing.so.2 to libdb, so a
+# distribution packaging for a kernel or container runtime that does not permit
+# io_uring syscalls (seccomp profiles commonly block them) needs a way to build
+# without the dependency.  Previously there was none -- the detection above ran
+# unconditionally and the comment's claim that the backends are "all optional"
+# was true of the code but not of the build.
+AC_ARG_WITH(uring,
+	AS_HELP_STRING([--without-uring],
+	    [Do not use the Linux io_uring AIO backend.]),
+	[with_uring="$withval"; uring_explicit="yes"],
+	[with_uring="yes"; uring_explicit="no"])
+AC_MSG_CHECKING([whether to use the io_uring AIO backend])
+AC_MSG_RESULT([$with_uring])
+# The detection runs UNCONDITIONALLY and only its use is gated.  This looks
+# redundant but is required: AC_CHECK_HEADER's first expansion also emits
+# autoconf's one-time compiler probes (notably the "options to detect undeclared
+# functions" setup) inline at that point.  Wrapping the first such check in a
+# shell `if` means that when the branch is not taken the setup never runs, and
+# the NEXT header check fails with "cannot make clang report undeclared
+# builtins" -- so --without-uring broke configure outright, in a way whose error
+# message named neither uring nor the real cause.  Probing an unused header is
+# cheap; losing the one-time setup is not.
+db_cv_uring_found="no"
+AC_CHECK_HEADER(liburing.h, [
+	AC_CHECK_LIB(uring, io_uring_queue_init, [db_cv_uring_found="yes"])])
+if test "$with_uring" != "no" -a "$db_cv_uring_found" = "yes"; then
+	AC_DEFINE(HAVE_IO_URING,
+	    1, [Define to 1 to use the Linux io_uring AIO backend.])
+	LIBSO_LIBS="$LIBSO_LIBS -luring"
+	LIBS="$LIBS -luring"
+fi
+# --with-uring asked for it explicitly, so a miss is an error rather than a
+# silent downgrade to synchronous I/O.  Plain ./configure stays auto-detecting.
+if test "$with_uring" != "no" -a "$uring_explicit" = "yes" \
+    -a "$db_cv_uring_found" = "no" ; then
+	AC_MSG_ERROR([--with-uring: liburing not found.
+Install the liburing development files, or configure --without-uring.])
+fi
+
+# POSIX aio: aio_read/aio_write may live in libc (BSD/macOS) or librt
+# (Solaris/illumos, glibc).  Record the library so os_aio_posix links.
+AC_CHECK_HEADER(aio.h, [
+	AC_SEARCH_LIBS(aio_read, [rt aio], [
+		AC_DEFINE(HAVE_AIO_POSIX,
+		    1, [Define to 1 to use the POSIX aio backend.])])])
+
+# kqueue+aio (BSD, notably FreeBSD): needs EVFILT_AIO and, crucially, the
+# sigev_notify_kqueue member of struct sigevent so a completed aiocb posts a
+# kevent.  macOS has EVFILT_AIO but lacks sigev_notify_kqueue, so it is
+# excluded here and uses the POSIX aio backend instead.
+AC_CHECK_MEMBER([struct sigevent.sigev_notify_kqueue],
+    [AC_CHECK_DECL([EVFILT_AIO], [
+	AC_DEFINE(HAVE_AIO_KQUEUE,
+	    1, [Define to 1 to use the BSD kqueue+aio backend.])],
+	[], [[#include <sys/event.h>]])],
+    [], [[#include <signal.h>
+#include <aio.h>]])
+
+AC_CHECK_HEADER(pthread.h, [
+	AC_DEFINE(HAVE_AIO_THREADPOOL,
+	    1, [Define to 1 to use the thread-pool AIO offload backend.])])
 
 # This is where we handle stuff that autoconf can't handle: compiler,
 # preprocessor and load flags, libraries that the standard tests don't
@@ -251,7 +360,50 @@ CXXFLAGS=${CXXFLAGS-"$CFLAGS"}
 # The default compiler is cc (NOT gcc), the default CFLAGS is as specified
 # above, NOT what is set by AC_PROG_CC, as it won't set optimization flags
 # for any compiler other than gcc.
+#
+# Berkeley DB is written in K&R (old-style) C: function definitions name
+# their parameters in a list following the parenthesis, with the prototype
+# supplied separately via the __P() macro.  C23 (gnu23) removed old-style
+# definitions from the language, so a modern Autoconf (>= 2.72) AC_PROG_CC,
+# which probes -std=gnu23 first and adopts it, turns every definition in the
+# tree into a hard error.  Suppress that probe by pre-seeding the C11/C23
+# feature-test cache variables to "no" so AC_PROG_CC adds no -std flag, then
+# pin a K&R-compatible standard (gnu99) ourselves below.
+ac_cv_prog_cc_c23=no
+ac_cv_prog_cc_c11=no
 AC_PROG_CC(cc gcc)
+
+# A modern Autoconf may still splice -std=gnu23 (or -std=c23) directly into
+# $CC despite the cache pre-seeding above.  Strip it so the K&R-incompatible
+# standard cannot win, then pin gnu99 in CFLAGS below.
+CC=`echo "$CC" | sed -e 's/ -std=gnu23//g' -e 's/ -std=c23//g'`
+
+# Pin a K&R-compatible C standard.  gnu99 keeps old-style definitions legal
+# (and retains the GNU extensions the tree relies on) under compilers that
+# would otherwise default to C23.
+case " $CFLAGS " in
+*" -std="*)	;;			# caller already chose a standard
+*)		CFLAGS="$CFLAGS -std=gnu99";;
+esac
+
+# The tree is deliberately K&R.  Even under gnu99, a sufficiently new clang
+# still warns on every old-style definition (-Wdeprecated-non-prototype) and
+# on sub-int K&R parameters whose default-argument promotion differs from the
+# ANSI prototype (-Wknr-promoted-parameter).  Both are inherent to the
+# intentional K&R style, so silence exactly those two warnings where the
+# compiler supports the flag.  Keep all other warnings.
+for db_knr_flag in -Wno-deprecated-non-prototype -Wno-knr-promoted-parameter; do
+	AS_VAR_PUSHDEF([db_knr_cv], [db_cv_cflag$db_knr_flag])
+	AC_CACHE_CHECK([whether $CC accepts $db_knr_flag], [db_knr_cv],
+	    [save_cflags="$CFLAGS"
+	     CFLAGS="$CFLAGS $db_knr_flag -Werror"
+	     AC_COMPILE_IFELSE([AC_LANG_PROGRAM([], [])],
+		[AS_VAR_SET([db_knr_cv], [yes])],
+		[AS_VAR_SET([db_knr_cv], [no])])
+	     CFLAGS="$save_cflags"])
+	AS_VAR_IF([db_knr_cv], [yes], [CFLAGS="$CFLAGS $db_knr_flag"])
+	AS_VAR_POPDEF([db_knr_cv])
+done
 
 # We know what compiler we're going to use, now.  Set per-compiler flags.
 if test "$GCC" = "yes"; then
@@ -266,11 +418,6 @@ if test "$GCC" = "yes"; then
 	else
 		CFLAGS=`echo "$CFLAGS" | sed 's/-O /-O3 /g'`
 	fi
-
-	# Suppress K&R function declaration warnings for legacy codebase
-	# Berkeley DB has many K&R style function declarations that would
-	# require extensive refactoring to modernize to ANSI C prototypes
-	CFLAGS="$CFLAGS -Wno-deprecated-non-prototype"
 else
 	case "$host_os" in
 	hpux11.0*)	;;
@@ -473,11 +620,26 @@ if test "$db_cv_java" = "yes" -o "$db_cv_jdbc" = "yes"; then
         	       	sed -e '/ version /!d' -e 's/.*"\(.*\)".*/\1/'` ;;
 	esac
 	AC_MSG_RESULT($JAVA_VERSION)
-	case "$JAVA_VERSION" in
-	1.[[3456789]]* | 1.[[1-9]][[0-9]]* | [[23456789]]* ) ;;
-	* )
-		AC_MSG_ERROR([Java version 1.3 or higher required, got $JAVA_VERSION]) ;;
+	#
+	# Accept 1.3 and later.  The old glob list was
+	#
+	#	1.[[3456789]]* | 1.[[1-9]][[0-9]]* | [[23456789]]* )
+	#
+	# whose last arm matches a SINGLE leading digit 2-9, so every JDK from
+	# 10 to 19 inclusive was rejected -- "17.0.20.1" begins with a 1 and so
+	# only the 1.x arms could match it, and neither does.  JDK 9, 21 and 23
+	# passed, which is why this went unnoticed: the breakage is a hole in the
+	# middle of the range, not at the end.  Compare the major number
+	# numerically instead, mapping legacy 1.N to N.
+	JAVA_MAJOR=`echo "$JAVA_VERSION" | sed -e 's/^1\.\([[0-9]][[0-9]]*\).*/\1/' \
+	    -e 's/^\([[0-9]][[0-9]]*\).*/\1/'`
+	case "$JAVA_MAJOR" in
+	'' | *[[!0-9]]* )
+		AC_MSG_ERROR([cannot parse the Java version "$JAVA_VERSION"]) ;;
 	esac
+	if test "$JAVA_MAJOR" -lt 3; then
+		AC_MSG_ERROR([Java version 1.3 or higher required, got $JAVA_VERSION])
+	fi
 
 	# Because of the code that SWIG generates to cast between pointers and
 	# integers, we need to add the flag "-fno-strict-aliasing" to the gcc
@@ -643,7 +805,7 @@ fi
 AC_HEADER_STAT
 AC_CHECK_HEADERS([sys/time.h time.h])
 AC_HEADER_DIRENT
-AC_CHECK_HEADERS(execinfo.h sys/select.h sys/socket.h sys/time.h)
+AC_CHECK_HEADERS(execinfo.h sys/random.h sys/select.h sys/socket.h sys/time.h)
 AC_CHECK_MEMBERS([struct stat.st_blksize])
 AM_TYPES
 
@@ -672,6 +834,31 @@ AM_DEFINE_MUTEXES
 # Check for native (system call or instruction set) support for
 # atomic increment, decrement, and compare & exchange.
 AM_DEFINE_ATOMIC
+
+# Automatic header-dependency tracking.  Berkeley DB's Makefile lists only .c
+# (and a few .incl) prerequisites per object -- no headers -- so editing a
+# shared header and running an incremental "make" silently leaves dependent
+# objects stale (a struct-layout change then mismatches across translation
+# units).  If the compiler understands the GCC/Clang -MMD/-MP/-MT flags, emit a
+# per-object .d makefile fragment and include it, so header edits rebuild every
+# dependent.  Left empty (today's behaviour) for compilers that don't.
+AC_MSG_CHECKING([whether $CC supports -MMD -MP for dependency tracking])
+db_save_cflags="$CFLAGS"
+CFLAGS="$CFLAGS -MMD -MP -MT conftest.o"
+AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[]], [[]])],
+    [db_dep_track=yes], [db_dep_track=no])
+CFLAGS="$db_save_cflags"
+rm -f conftest.d
+if test "$db_dep_track" = yes; then
+	DEPFLAGS='-MMD -MP -MT $@'
+	DEP_INCLUDE='-include $(wildcard *.d) $(wildcard .libs/*.d)'
+else
+	DEPFLAGS=
+	DEP_INCLUDE=
+fi
+AC_MSG_RESULT([$db_dep_track])
+AC_SUBST(DEPFLAGS)
+AC_SUBST(DEP_INCLUDE)
 
 # Check for os-specific event support for performance monitoring such as
 # DTrace or SystemTap.
@@ -722,6 +909,11 @@ AC_CHECK_FUNCS(\
 	getrusage getuid hstrerror mprotect pstat_getdynamic\
 	pthread_self pthread_yield random sched_yield select setgid setuid\
 	sigaction snprintf stat sysconf vsnprintf yield)
+
+# Cryptographically strong OS entropy, used to seed encryption IVs.
+# getrandom(2) is Linux/glibc 2.25+; arc4random_buf(3) is the BSDs and macOS.
+# Neither is required: os_csprng.c falls back to reading /dev/urandom.
+AC_CHECK_FUNCS(getrandom arc4random_buf)
 
 AC_TIMERS
 

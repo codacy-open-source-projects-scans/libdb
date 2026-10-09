@@ -1,0 +1,141 @@
+#!/bin/sh
+# test/lockmatrix/run.sh -- build and run the Tier B3 lock-mode matrix.
+#
+# Exercises every db_lockmode_t through lock_get / lock_put / lock_vec, the
+# whole conflict matrix, and the lock-LIST operations (DB_LOCK_PUT_READ,
+# DB_LOCK_UPGRADE_WRITE) with a locker holding a MIX of write and SIREAD
+# locks -- the shape that overflows the objlist allocation in issue #140.
+#
+# The interesting failure is an out-of-bounds WRITE inside libdb's own
+# allocation, which is only observable when LIBDB ITSELF is ASan-instrumented.
+# A harness-only ASan build cannot see it.  So by default this builds (once,
+# reusing the fuzz tier's mechanism and directory) an ASan libdb under
+# build_asan_gate/ and links against that.
+#
+# On current master (#140 unfixed) an ASan run is EXPECTED to abort with a
+# heap-buffer-overflow inside __lock_vec.  The harness prints each shape
+# before attempting it, so the last line of output names the shape that
+# faulted.  When #140 lands, the whole matrix must complete and exit 0.
+#
+# Usage:
+#   ./run.sh                     # build (ASan libdb) + run every section
+#   ./run.sh build               # build only
+#   ./run.sh modes|conflicts|list ...
+#
+# Env:
+#   CC             compiler (default: clang; needed for the ASan libdb)
+#   LIBDB_ASAN     1 => build/use an ASan-instrumented libdb (default 1)
+#   LIBDB_BUILD    explicit libdb build dir (skips the ASan auto-build)
+#   LOCK_TIMEOUT   seconds for the run (default 600)
+#
+# Run from test/lockmatrix/ inside a `nix develop` shell.
+
+set -eu
+
+HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+cd "$HERE"
+
+# Verdict emission for the test-execution manifest gate (test/MANIFEST).
+. "$HERE/../harness.sh"
+hi_init lockmatrix "$HERE/.."
+
+# Pick a compiler that can actually build the ASan libdb this tier needs.
+#
+# This used to be a bare CC=${CC:-clang}, so on a runner without clang the whole
+# tier could not run (defect T6).  gcc supports -fsanitize=address just as well
+# for our purposes, so prefer an explicit $CC, then clang, then gcc -- and verify
+# the choice by COMPILING with the sanitizer flag rather than by checking the
+# binary exists, because a gcc without libasan installed passes `command -v' and
+# then fails at link time.
+if [ -z "${CC:-}" ] ; then
+	for cand in clang gcc cc ; do
+		command -v "$cand" >/dev/null 2>&1 || continue
+		probe=${TMPDIR:-/tmp}/lm_ccprobe_$$
+		echo 'int main(void){return 0;}' > "$probe.c"
+		if "$cand" -fsanitize=address "$probe.c" -o "$probe" 2>/dev/null ; then
+			CC=$cand
+			rm -f "$probe" "$probe.c"
+			break
+		fi
+		rm -f "$probe" "$probe.c"
+	done
+fi
+if [ -z "${CC:-}" ] ; then
+	echo "run.sh: SKIP no compiler here supports -fsanitize=address"
+	echo "run.sh: tried clang, gcc, cc; set CC to override"
+	exit 0
+fi
+echo "run.sh: using CC=$CC"
+LIBDB_ASAN=${LIBDB_ASAN:-1}
+LOCK_TIMEOUT=${LOCK_TIMEOUT:-600}
+OUT="$HERE/build"
+
+# Same mechanism as test/fuzz/check-crashes.sh: one shared ASan libdb under
+# build_asan_gate/, built on demand and reused by both tiers.
+if [ "$LIBDB_ASAN" = "1" ] && [ -z "${LIBDB_BUILD:-}" ]; then
+	GATE_BUILD="$HERE/../../build_asan_gate"
+	if [ ! -f "$GATE_BUILD/libdb.a" ]; then
+		echo "building ASan libdb in $GATE_BUILD (once) ..."
+		mkdir -p "$GATE_BUILD"
+		( cd "$GATE_BUILD" &&
+		  ../dist/configure --enable-debug \
+		      CC="$CC" CFLAGS="-fsanitize=address -g -O1" \
+		      >configure.log 2>&1 &&
+		  make -j"$(nproc 2>/dev/null || echo 4)" >build.log 2>&1 ) ||
+		echo "warning: ASan libdb build failed; falling back" >&2
+	fi
+	[ -f "$GATE_BUILD/libdb.a" ] && LIBDB_BUILD="$GATE_BUILD"
+fi
+LIBDB_BUILD=${LIBDB_BUILD:-"$HERE/../../build_unix"}
+LIBDBA="$LIBDB_BUILD/libdb.a"
+
+if [ -f "$LIBDB_BUILD/Makefile" ]; then
+	LDLIBS=$(sed -n 's/^LIBS=[[:space:]]*//p' "$LIBDB_BUILD/Makefile" | head -1)
+fi
+LDLIBS="${LDLIBS:--lpthread} -ldl -lpthread"
+
+# ASan on the harness too, so the harness's own DBTs are red-zoned.
+CFLAGS="-g -O1 -Wall -Wextra -Wno-unused-parameter -fsanitize=address"
+# -I the source root and src/ as well: test_lock_matrix.c includes db_int.h so
+# it can call __os_free, the matching deallocator for the memory lock_vec
+# hands back (see the note at the free site).  db_int.h then includes
+# dbinc/queue.h, which is only reachable with src/ on the path.
+CFLAGS="$CFLAGS -I$LIBDB_BUILD -I$HERE -I$HERE/../.. -I$HERE/../../src"
+
+[ -f "$LIBDBA" ] || {
+	echo "error: libdb.a not found at $LIBDBA -- build libdb first:" >&2
+	echo "    (cd $LIBDB_BUILD && ../dist/configure --enable-debug && make -j4)" >&2
+	exit 2
+}
+echo "linking against $LIBDBA"
+
+mkdir -p "$OUT"
+# shellcheck disable=SC2086
+$CC $CFLAGS "$HERE/test_lock_matrix.c" "$LIBDBA" $LDLIBS \
+	-o "$OUT/test_lock_matrix"
+echo "built $OUT/test_lock_matrix"
+
+[ "${1:-}" = "build" ] && exit 0
+
+cd "$OUT"
+
+# One invocation PER SECTION rather than one run of all three.
+#
+# The driver already exits non-zero iff any check failed, so a per-section
+# invocation yields a per-section verdict from the exit status alone -- no
+# output parsing, and no second output format to keep in step with the driver.
+# (An ASan abort in one section also no longer hides whether the others ran:
+# each has its own RESULT line, or visibly lacks one.)
+rc=0
+for sec in ${*:-modes conflicts list}; do
+	echo "=== lockmatrix section: $sec"
+	if timeout "$LOCK_TIMEOUT" ./test_lock_matrix "$sec"; then
+		hi_emit "$sec" pass
+	else
+		src=$?
+		echo "--- lockmatrix $sec: FAIL (exit $src)"
+		hi_emit "$sec" fail
+		rc=$src
+	fi
+done
+exit $rc

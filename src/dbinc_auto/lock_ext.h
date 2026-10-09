@@ -7,6 +7,8 @@ extern "C" {
 #endif
 
 int __lock_vec_pp __P((DB_ENV *, u_int32_t, u_int32_t, DB_LOCKREQ *, int, DB_LOCKREQ **));
+int __lock_sicleanup __P((ENV *));
+int __lock_sicommit __P((ENV *, DB_LOCKER *, int));
 int __lock_vec __P((ENV *, DB_LOCKER *, u_int32_t, DB_LOCKREQ *, int, DB_LOCKREQ **));
 int __lock_get_pp __P((DB_ENV *, u_int32_t, u_int32_t, DBT *, db_lockmode_t, DB_LOCK *));
 int __lock_get __P((ENV *, DB_LOCKER *, u_int32_t, const DBT *, db_lockmode_t, DB_LOCK *));
@@ -30,6 +32,7 @@ int __lock_id_set __P((ENV *, u_int32_t, u_int32_t));
 int __lock_getlocker __P((DB_LOCKTAB *, u_int32_t, int, DB_LOCKER **));
 int __lock_getlocker_int __P((DB_LOCKTAB *, u_int32_t, int, DB_LOCKER **));
 int __lock_addfamilylocker __P((ENV *, u_int32_t, u_int32_t, u_int32_t));
+int __lock_sireap_lockers __P((ENV *));
 int __lock_freelocker  __P((DB_LOCKTAB *, DB_LOCKER *));
 int __lock_familyremove  __P((DB_LOCKTAB *, DB_LOCKER *));
 int __lock_fix_list __P((ENV *, DBT *, u_int32_t));
@@ -65,6 +68,7 @@ int __lock_stat_pp __P((DB_ENV *, DB_LOCK_STAT **, u_int32_t));
 int __lock_stat_print_pp __P((DB_ENV *, u_int32_t));
 int  __lock_stat_print __P((ENV *, u_int32_t));
 void __lock_printlock __P((DB_LOCKTAB *, DB_MSGBUF *mbp, struct __db_lock *, int));
+void __lock_printlock_fl __P((DB_LOCKTAB *, DB_MSGBUF *mbp, struct __db_lock *, int, int));
 int __lock_set_timeout __P((ENV *, DB_LOCKER *, db_timeout_t, u_int32_t));
 int __lock_set_timeout_internal __P((ENV *, DB_LOCKER *, db_timeout_t, u_int32_t));
 int __lock_inherit_timeout __P((ENV *, DB_LOCKER *, DB_LOCKER *));

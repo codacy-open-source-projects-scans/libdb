@@ -11,8 +11,13 @@
 #include "db_int.h"
 #include "dbinc/log.h"
 #include "dbinc/mp.h"
+#include "dbinc/os_aio.h"
 #include "dbinc/db_page.h"
 #include "dbinc/hash.h"
+
+#ifdef HAVE_DST
+#include "sim_inject.h"			/* DST planted-bug harness. */
+#endif
 
 typedef struct {
 	DB_MPOOL_HASH *track_hp;	/* Hash bucket. */
@@ -300,12 +305,96 @@ __memp_sync_int(env, dbmfp, trickle_max, flags, wrote_totalp, interruptedp)
 	roff_t last_mf_offset;
 	u_int32_t ar_cnt, ar_max, i, n_cache, remaining, wrote_total;
 	int32_t wrote_cnt;
-	int dirty, filecnt, maxopenfd, required_write, ret, t_ret;
+	int dirty, filecnt, maxopenfd, required_write, ret, t_ret, trylock_err;
+	MEMP_AIO_W aiow[MEMP_AIO_WINDOW];	/* async writeback window */
+	int deferred, nflight, use_aio;
 
 	dbmp = env->mp_handle;
 	mp = dbmp->reginfo[0].primary;
 	last_mf_offset = INVALID_ROFF;
 	filecnt = wrote_total = 0;
+	nflight = 0;
+
+	/*
+	 * Async writeback requires EXCLUSIVE use of the per-process aio
+	 * context for the whole span from our first submit to our final
+	 * drain: our completion window (aiow) lives in this stack frame and
+	 * is the cookie of our in-flight ops, and a drain reaps whatever the
+	 * shared completion queue holds.  Two concurrent __memp_sync_int
+	 * callers sharing one context would cross-reap -- caller A's
+	 * drain-by-count satisfied by caller B's completions, so A runs the
+	 * write completion (clear BH_DIRTY, unpin, free the pgout copy) for
+	 * writes that have not reached the disk.  That is exactly the false
+	 * durable frontier the async error propagation exists to prevent.
+	 *
+	 * So take the context's mtx_aio, and take it with TRYLOCK, never
+	 * blocking: any caller that does not win it (checkpoint vs trickle vs
+	 * a DB_SYNC_ALLOC from eviction) falls back to synchronous writeback,
+	 * which is the reference behaviour and always correct.  Never
+	 * waiting also means this latch cannot deadlock: it is held across
+	 * page writes that acquire hp->mtx_hash, bhp->mtx_buf and
+	 * dbmp->mutex, but since no thread ever sleeps to acquire it, it can
+	 * never be the blocking edge of a cycle.
+	 *
+	 * The latch lives in the aio context, not in DB_MPOOL: env_sig.c
+	 * hashes sizeof(struct __db_mpool) into the build signature, which
+	 * __env_region_attach checks, so growing DB_MPOOL would make every
+	 * existing environment fail to attach (see dbinc/os_aio.h).
+	 *
+	 * FIXED (was a ~5% hang in test/c/aio_concurrent_sync "aio" mode).  A
+	 * deferred async write holds its buffer's pin (ref + shared mtx_buf)
+	 * until the write is reaped, and the window used to be reaped only
+	 * when nflight reached MEMP_AIO_WINDOW.  That made the deferred path
+	 * hold pins across waits, which produced two distinct permanent
+	 * stalls, both measured with gdb (see test/c/OS-AIO-DEADLOCK-FIX.md):
+	 *
+	 *  A) HOLD-AND-BLOCK.  The latch winner blocked in
+	 *     MUTEX_READLOCK(bhp->mtx_buf) below for a NEW buffer while
+	 *     holding a partly-full window's pins.  A writer wanted one of
+	 *     those pinned buffers exclusively (__memp_fget under __bam_split
+	 *     -> __db_new), so it blocked on that mtx_buf while holding the
+	 *     PGNO_BASE_MD write lock, and the other writers piled up behind
+	 *     it in __lock_get_internal.  A true cycle.
+	 *
+	 *  B) HOLD-AND-SPIN.  The latch winner never blocked at all: its
+	 *     remaining tracked buffers were all BH_EXCLUSIVE (held by the
+	 *     writer that is itself blocked on one of OUR pinned buffers), so
+	 *     with required_write set it spun the retry loop at the __os_yield
+	 *     above forever, still holding the window's pins.  No mutex wait
+	 *     to see in the winner's backtrace -- the winner is RUNNABLE and
+	 *     the cycle closes through the pins it holds.  This variant is the
+	 *     more common of the two here (4 of 6 captures).
+	 *
+	 * Both are the same defect -- pins held across a wait the pin holder
+	 * cannot end -- so both need the same rule: NEVER wait while holding
+	 * deferred pins.  This function now enforces it in two places, and
+	 * both are needed because there are two waits:
+	 *
+	 *   - before the blocking MUTEX_READLOCK(bhp->mtx_buf) below, we
+	 *     MUTEX_TRY_READLOCK first, and on failure drain the window (which
+	 *     releases every pin) before blocking.  That kills variant A.
+	 *   - before the retry-loop __os_yield above, we drain the window.
+	 *     That kills variant B and, because the drain also lets the
+	 *     writer's own progress resume, ends the spin.
+	 *
+	 * The drain is the completion path, not a shortcut: it reaps the real
+	 * completions, runs __memp_pgwrite_finish for each, and propagates the
+	 * first error through "ret", exactly as the full-window drain does.
+	 * Draining early only shortens the window; it never skips a write, and
+	 * it never clears BH_DIRTY for a write that has not completed.
+	 *
+	 * Side effect worth noting: both blocking MUTEX_READLOCKs of mtx_buf
+	 * below are now reached only with nflight == 0, so the macro's bare
+	 * "return (DB_RUNRECOVERY)" can no longer abandon a live window.
+	 *
+	 * This was never the cross-reap corruption this latch fixes: lost=0
+	 * and db_recover + db_verify were clean on every occurrence, whereas
+	 * the unlatched path SEGVs in __aio_uring_reap.
+	 */
+	use_aio = 0;
+	if (dbmp->aio_ctx != NULL && __os_aio_ctx_available(dbmp->aio_ctx) &&
+	    MUTEX_TRYLOCK(env, dbmp->aio_ctx->mtx_aio) == 0)
+		use_aio = 1;
 
 	if (wrote_totalp != NULL)
 		*wrote_totalp = 0;
@@ -329,8 +418,11 @@ __memp_sync_int(env, dbmfp, trickle_max, flags, wrote_totalp, interruptedp)
 	/* Assume one dirty page per bucket. */
 	ar_max = mp->nreg * mp->htab_buckets;
 	if ((ret =
-	    __os_malloc(env, ar_max * sizeof(BH_TRACK), &bharray)) != 0)
+	    __os_malloc(env, ar_max * sizeof(BH_TRACK), &bharray)) != 0) {
+		if (use_aio)
+			MUTEX_UNLOCK(env, dbmp->aio_ctx->mtx_aio);
 		return (ret);
+	}
 
 	/*
 	 * Walk each cache's list of buffers and mark all dirty buffers to be
@@ -352,7 +444,7 @@ __memp_sync_int(env, dbmfp, trickle_max, flags, wrote_totalp, interruptedp)
 #ifdef DIAGNOSTIC
 			if (SH_TAILQ_FIRST(&hp->hash_bucket, __bh) == NULL)
 #else
-			if (atomic_read(&hp->hash_page_dirty) == 0)
+			if (atomic_read_relaxed(&hp->hash_page_dirty) == 0)
 #endif
 				continue;
 
@@ -428,7 +520,7 @@ __memp_sync_int(env, dbmfp, trickle_max, flags, wrote_totalp, interruptedp)
 			 * in sync with the number of bits counted.
 			 */
 			DB_ASSERT(env,
-			    dirty == (int)atomic_read(&hp->hash_page_dirty));
+			    dirty == (int)atomic_read_relaxed(&hp->hash_page_dirty));
 			MUTEX_UNLOCK(env, hp->mtx_hash);
 
 			/* Check if the call has been interrupted. */
@@ -480,6 +572,24 @@ __memp_sync_int(env, dbmfp, trickle_max, flags, wrote_totalp, interruptedp)
 	for (i = wrote_cnt = 0, remaining = ar_cnt; remaining > 0; ++i) {
 		if (i >= ar_cnt) {
 			i = 0;
+			/*
+			 * We are about to sleep and come back for buffers we
+			 * could not get this pass.  Deferred async writes hold
+			 * their buffers' pins, and the reason we could not get
+			 * those buffers may BE a thread that is itself blocked
+			 * on one of our pinned buffers (stall variant B, above:
+			 * the winner spins here forever while a writer waits on
+			 * a pin we hold).  Reap the window first so we sleep
+			 * holding nothing.  The drain propagates write errors
+			 * into ret exactly as the full-window drain does.
+			 */
+			if (nflight > 0) {
+				t_ret = __memp_aio_drain(env, dbmp,
+				    dbmp->aio_ctx, aiow, nflight, &ret);
+				wrote_cnt += t_ret;
+				wrote_total += t_ret;
+				nflight = 0;
+			}
 			__os_yield(env, 1, 0);
 		}
 		if ((hp = bharray[i].track_hp) == NULL)
@@ -523,7 +633,40 @@ __memp_sync_int(env, dbmfp, trickle_max, flags, wrote_totalp, interruptedp)
 		/* Pin the buffer into memory. */
 		atomic_inc(env, &bhp->ref);
 		MUTEX_UNLOCK(env, mutex);
-		MUTEX_READLOCK(env, bhp->mtx_buf);
+		/*
+		 * Do not block here while holding deferred pins (stall variant
+		 * A, above).  Try first; if the latch is busy and we are
+		 * holding a partly-full window, reap it -- releasing every pin
+		 * we hold -- and only then block.  After the drain the thread
+		 * we would have deadlocked against can proceed, so the blocking
+		 * acquire below is safe: we hold no buffer hostage.
+		 */
+		if (nflight > 0 &&
+		    (t_ret = MUTEX_TRY_READLOCK(env, bhp->mtx_buf)) != 0) {
+			/*
+			 * Busy, or a failchk error.  EITHER WAY reap the window
+			 * first: we must not wait while holding pins, and no
+			 * async write may outlive this frame -- the err label
+			 * asserts nflight == 0 because aiow and w->ctx are stack
+			 * state, so an error exit with a live window would let a
+			 * completion write through a dead frame.
+			 */
+			trylock_err =
+			    t_ret == DB_LOCK_NOTGRANTED ? 0 : t_ret;
+			t_ret = __memp_aio_drain(env, dbmp,
+			    dbmp->aio_ctx, aiow, nflight, &ret);
+			wrote_cnt += t_ret;
+			wrote_total += t_ret;
+			nflight = 0;
+			if (trylock_err != 0) {
+				atomic_dec(env, &bhp->ref);
+				if (ret == 0)
+					ret = trylock_err;
+				goto err;
+			}
+			MUTEX_READLOCK(env, bhp->mtx_buf);
+		} else if (nflight == 0)
+			MUTEX_READLOCK(env, bhp->mtx_buf);
 		DB_ASSERT(env, !F_ISSET(bhp, BH_EXCLUSIVE));
 
 		/*
@@ -557,10 +700,18 @@ __memp_sync_int(env, dbmfp, trickle_max, flags, wrote_totalp, interruptedp)
 		 * If the buffer is dirty, we write it.  We only try to
 		 * write the buffer once.
 		 */
+		deferred = 0;
 		if (F_ISSET(bhp, BH_DIRTY)) {
 			mfp = R_ADDR(dbmp->reginfo, bhp->mf_offset);
-			if ((t_ret =
-			    __memp_bhwrite(dbmp, hp, mfp, bhp, 1)) == 0) {
+			if (use_aio)
+				t_ret = __memp_bhwrite_async(dbmp, hp, mfp,
+				    bhp, dbmp->aio_ctx, &aiow[nflight],
+				    &deferred);
+			else
+				t_ret = __memp_bhwrite(dbmp, hp, mfp, bhp, 1);
+			if (deferred)
+				++nflight;
+			else if (t_ret == 0) {
 				++wrote_cnt;
 				++wrote_total;
 			} else {
@@ -583,10 +734,22 @@ __memp_sync_int(env, dbmfp, trickle_max, flags, wrote_totalp, interruptedp)
 		--remaining;
 		bharray[i].track_hp = NULL;
 
-		/* Discard our buffer reference. */
-		DB_ASSERT(env, atomic_read(&bhp->ref) > 0);
-		atomic_dec(env, &bhp->ref);
-		MUTEX_UNLOCK(env, bhp->mtx_buf);
+		/*
+		 * Discard our buffer reference.  For a deferred async write
+		 * the pin (ref + shared mtx_buf) is held until the write
+		 * completes; drain the window when it is full.
+		 */
+		if (!deferred) {
+			DB_ASSERT(env, atomic_read(&bhp->ref) > 0);
+			atomic_dec(env, &bhp->ref);
+			MUTEX_UNLOCK(env, bhp->mtx_buf);
+		} else if (nflight >= MEMP_AIO_WINDOW) {
+			t_ret = __memp_aio_drain(env, dbmp,
+			    dbmp->aio_ctx, aiow, nflight, &ret);
+			wrote_cnt += t_ret;
+			wrote_total += t_ret;
+			nflight = 0;
+		}
 
 		/* Check if the call has been interrupted. */
 		if (LF_ISSET(DB_SYNC_INTERRUPT_OK) &&
@@ -594,6 +757,11 @@ __memp_sync_int(env, dbmfp, trickle_max, flags, wrote_totalp, interruptedp)
 			STAT(++mp->stat.st_sync_interrupted);
 			if (interruptedp != NULL)
 				*interruptedp = 1;
+			if (nflight > 0) {
+				wrote_total += __memp_aio_drain(env,
+				    dbmp, dbmp->aio_ctx, aiow, nflight, &ret);
+				nflight = 0;
+			}
 			goto err;
 		}
 
@@ -612,6 +780,19 @@ __memp_sync_int(env, dbmfp, trickle_max, flags, wrote_totalp, interruptedp)
 	}
 
 done:	/*
+	 * Drain any async writes still in flight before forcing pages to
+	 * disk: the fsync below must follow all completed writes.  A failed
+	 * async write sets ret (via the drain), so required_write's fsync is
+	 * skipped and the checkpoint fails -- matching the synchronous path,
+	 * where a page-write error already left ret non-zero.
+	 */
+	if (nflight > 0) {
+		wrote_total += __memp_aio_drain(env,
+		    dbmp, dbmp->aio_ctx, aiow, nflight, &ret);
+		nflight = 0;
+	}
+
+	/*
 	 * If a write is required, we have to force the pages to disk.  We
 	 * don't do this as we go along because we want to give the OS as
 	 * much time as possible to lazily flush, and because we have to flush
@@ -621,8 +802,29 @@ done:	/*
 	if (ret == 0 && required_write) {
 		if (dbmfp == NULL)
 			ret = __memp_sync_files(env);
+#if defined(HAVE_DST)
+#if DB_DST_BUG(7)
+		/*
+		 * PLANTED BUG SYNCSKIP (DB_DST_INJECT_BUG=7): a single-file
+		 * sync (db->sync / checkpoint of one file) WRITES the dirty
+		 * pages but SKIPS the fsync, then reports success.  The
+		 * pages reached the file via pwrite, but the durable frontier
+		 * never advances, so a power loss (write-back crash) drops
+		 * them.  With no log to redo (a non-txn env), the flushed
+		 * records are gone after the crash; test_sim_ckp_crash's
+		 * "every synced record survives" invariant fires.  Compiled
+		 * out of every normal build.
+		 */
+		else
+			ret = 0;
+#else
 		else
 			ret = __os_fsync(env, dbmfp->fhp);
+#endif
+#else
+		else
+			ret = __os_fsync(env, dbmfp->fhp);
+#endif
 	}
 
 	/* If we've opened files to flush pages, close them. */
@@ -630,6 +832,17 @@ done:	/*
 		ret = t_ret;
 
 err:	__os_free(env, bharray);
+	/*
+	 * Every exit path passes here, and no async write may outlive this
+	 * frame: aiow (the ops' cookie) and w->ctx (holding the pgout page
+	 * copy and the mfp writer count) are stack state, so a completion
+	 * running after we return would write through a dead frame.  The
+	 * drains above cover the normal and interrupt paths; this assert
+	 * catches any future early-exit that forgets one.
+	 */
+	DB_ASSERT(env, nflight == 0);
+	if (use_aio)
+		MUTEX_UNLOCK(env, dbmp->aio_ctx->mtx_aio);
 	if (wrote_totalp != NULL)
 		*wrote_totalp = wrote_total;
 

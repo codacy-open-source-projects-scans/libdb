@@ -118,7 +118,7 @@ __memp_dirty(dbmfp, addrp, ip, txn, priority, flags)
 	MUTEX_UNLOCK(env, bhp->mtx_buf);
 	MUTEX_LOCK(env, bhp->mtx_buf);
 	DB_ASSERT(env, !F_ISSET(bhp, BH_EXCLUSIVE));
-	F_SET(bhp, BH_EXCLUSIVE);
+	BH_SET_EXCLUSIVE(bhp);
 
 	/* Set/clear the page bits. */
 	if (!F_ISSET(bhp, BH_DIRTY)) {
@@ -137,7 +137,7 @@ __memp_dirty(dbmfp, addrp, ip, txn, priority, flags)
 	MVCC_MPROTECT(bhp->buf, mfp->pagesize, PROT_READ | PROT_WRITE);
 #endif
 	DB_ASSERT(env, !F_ISSET(bhp, BH_DIRTY) ||
-	    atomic_read(&hp->hash_page_dirty) != 0);
+	    atomic_read_relaxed(&hp->hash_page_dirty) != 0);
 	return (0);
 }
 
@@ -162,7 +162,7 @@ __memp_shared(dbmfp, pgaddr)
 	if (F_ISSET(bhp, BH_DIRTY))
 		dbmfp->mfp->file_written = 1;
 	DB_ASSERT(env, F_ISSET(bhp, BH_EXCLUSIVE));
-	F_CLR(bhp, BH_EXCLUSIVE);
+	BH_CLR_EXCLUSIVE(bhp);
 	MUTEX_UNLOCK(env, bhp->mtx_buf);
 	MUTEX_READLOCK(env, bhp->mtx_buf);
 

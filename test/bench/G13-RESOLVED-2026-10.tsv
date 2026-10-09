@@ -1,0 +1,88 @@
+# G13 after B2: how much negative scaling is the ENGINE's?
+#
+# Host: c6id.8xlarge, 32 vCPU, Debian 12 (6.1.0), XFS on instance NVMe,
+# THP off, numa_balancing off. libdb at c0f541e6f (U6b fix live:
+# HAVE_MUTEX_HYBRID=1, so mut_tas.c is compiled in for the first time).
+# btree, -d nosync, 20s measured, 10s warmup. Arms AND thread counts
+# alternated within each rep.
+#
+# ARM A/B: one binary per arm, differing ONLY at the six DB_RMW call sites.
+#
+rep	arm	threads	commits	retries	retry_per_commit
+1	before	8	428523	116064	0.271
+1	after	8	568100	13349	0.023
+1	before	32	89651	511322	5.703
+1	after	32	485432	14801	0.030
+2	before	8	567991	157089	0.277
+2	after	8	564810	12709	0.023
+2	before	32	89309	507479	5.682
+2	after	32	524439	16378	0.031
+3	before	8	392299	108332	0.276
+3	after	8	563741	12975	0.023
+3	before	32	89347	509268	5.700
+3	after	32	538643	16631	0.031
+#
+# medians, t=8 -> t=32:
+#   before  428523 -> 89347   = -79.2%   (retry/commit 5.70 at t=32)
+#   after   564810 -> 524439  =  -7.1%   (retry/commit 0.031, 184x fewer)
+#
+# So the -76.8% originally attributed to the engine was substantially the
+# driver's missing DB_RMW. cv: before t=8 20.0%, after t=8 0.4%.
+#
+# --- THE GATE, same binary, reps=9, ONLY the warehouse count differs -------
+# scale	threads_lo	threads_hi	tpm_lo	tpm_hi	delta_pct	tol_pct	verdict
+96	8	32	1744346	1304111	-25.2	11.6	FAIL
+32	8	32	1534762	1480739	-3.5	11.2	PASS
+#
+# The gate defaults to SCALE=96; my A/B used 32, which is why they disagree.
+# Both are correct measurements of different working-set sizes.
+#
+# COUNTER-INTUITIVE AND LOAD-BEARING: scale 96 has MORE warehouses, hence LESS
+# per-row contention, yet scales WORSE. So the residual decline is not row
+# conflict. It is also not I/O: the scale-96 record set is 0.23 GiB against a
+# cache over 1 GB, and db_stat reports "Threads waited on page I/O: 0".
+#
+# --- CORRECTION (2026-10-08) ---------------------------------------------
+#
+# The subsystem table below is WRONG and is kept only so the error is visible.
+# I collected it with `db_stat -l`, believing -l meant "lock". IT MEANS LOG.
+# So "lock_region_waits 774650 -> 641738" is the LOG region latch, and the
+# conclusion "the residual is the lock region latch" does not follow from it.
+#
+# The lock subsystem is `db_stat -c`. Re-measured correctly on a 64 vCPU
+# c6id.16xlarge at scale 96, stats CLEARED before each run, per-commit:
+#
+#   t   commits   part/cmt  lockeralloc/cmt  region/cmt  objq/cmt  conflict/cmt
+#   8    639029     0.1496          0.1189      1.1819    0.0005        0.1663
+#   16   391736     0.1899          0.2220      1.4552    0.0023        0.3373
+#   32   311811     0.2291          0.3446      1.4761    0.0058        0.5582
+#   64   270224     0.2902          0.6220      1.5028    0.0090        0.7667
+#
+# per-commit growth t=8 -> t=64:
+#   locker-alloc  5.2x   <-- fastest-growing LATCH wait, 15% of acquisitions
+#   lock-conflict 4.6x       (a consequence, not a latch)
+#   partition     1.9x
+#   region        1.3x
+#   obj-queue    18.8x       but absolute value is negligible (0.009/commit)
+#
+# THE SERIALIZATION POINT IS mtx_locker_stripe[0]. Despite living in the
+# stripe array it is NOT a stripe: lock.h:383 documents it as the LOCKER
+# ALLOCATION latch, guarding region-wide state with no per-bucket home (the
+# free_lockers list, the ulinks list, nlockers, and the lock_id/cur_maxid
+# counters). It is taken ~4x per transaction, by __lock_id,
+# __lock_getlocker (txn_begin, txn.c:588) and __lock_freelocker (txn end).
+#
+# __lock_getlocker holds it across the WHOLE call -- including the common case
+# where the free list is non-empty and only a bucket is touched -- purely to
+# make the free-list emptiness test atomic with the refill.
+#
+# --- SUPERSEDED (collected with the wrong db_stat flag) --------------------
+# subsystem	t=8	t=32	note
+mpool_bucket_waits	0	0	zero at BOTH thread counts
+mpool_region_waits	1	1	noise
+page_io_waits	0	0	working set is cache-resident
+lock_region_waits	774650	641738	6% of acquisitions at t=8, 9% at t=32
+lock_region_per_commit	1.125	1.603	1.4x more per unit of work at t=32
+#
+# The residual is the LOCK REGION latch. Not the buffer pool (zero waits), not
+# the log (RFC 0008 already measured that), and not the page cache.

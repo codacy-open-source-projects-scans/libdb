@@ -93,6 +93,11 @@ typedef struct __txn_detail {
 	db_mutex_t	mvcc_mtx;	/* Version mutex. */
 	u_int32_t	mvcc_ref;	/* Number of buffers created by this
 					   transaction still in cache.  */
+	db_atomic_t	si_ref;		/* SSI: outstanding SIREAD markers that
+					   reference this detail (keeps it alive
+					   past commit, parallels mvcc_ref).
+					   Atomic: inc/dec occur under different
+					   lock-manager partition mutexes. */
 
 	u_int32_t	priority;	/* Deadlock resolution priority. */
 
@@ -107,6 +112,9 @@ typedef struct __txn_detail {
 #define	TXN_DTL_INMEMORY	0x04	/* uses in memory logs */
 #define	TXN_DTL_SNAPSHOT	0x08	/* On the list of snapshot txns. */
 #define	TXN_DTL_NOWAIT		0x10	/* Don't block on locks. */
+#define	TXN_DTL_WCONF		0x20	/* SSI: write end of an rw-conflict. */
+#define	TXN_DTL_RCONF		0x40	/* SSI: read end of an rw-conflict. */
+#define	TXN_DTL_SICHECKED	0x80	/* SSI: past its commit pivot check. */
 	u_int32_t flags;
 
 	SH_TAILQ_ENTRY	links;		/* active/free/snapshot list */
@@ -121,6 +129,35 @@ typedef struct __txn_detail {
 	int32_t format;			/* XA format */
 	roff_t slots[TXN_NSLOTS];	/* Initial DB slot allocation. */
 } TXN_DETAIL;
+
+/*
+ * TXN_SI_PAST_CHECK --
+ *	SSI: TRUE when this transaction will not consult its own pivot flags
+ *	again, so a writer forming an rw-conflict edge into it now cannot defer
+ *	the conflict to it and must resolve the edge itself.  That is the case
+ *	once the transaction has committed and, crucially, also while it is
+ *	inside DB_TXN->commit past its one and only pivot check: __txn_commit
+ *	publishes TXN_DTL_SICHECKED under TXN_SYSTEM_LOCK, atomically with that
+ *	check.
+ *
+ *	Without the flag the whole span from the pivot check to __txn_end's
+ *	status store still reads TXN_RUNNING, so a writer deferred to a check
+ *	that had already happened and both transactions committed a write skew
+ *	(issue #136).  An aborted transaction is deliberately NOT "past check":
+ *	its reads never committed, so an edge into it is not a conflict at all
+ *	-- hence the status test rather than testing TXN_DTL_SICHECKED alone,
+ *	which survives on the detail if the commit fails after publishing it.
+ *	In that narrow error window (commit published the flag, then failed and
+ *	his on its way to TXN_ABORTED) a writer may abort itself needlessly.
+ *	That errs safe -- a spurious DB_SNAPSHOT_UNSAFE, never a missed one --
+ *	and only on a path where the peer is already failing.
+ *
+ *	Callers hold TXN_SYSTEM_LOCK, which is where every writer of the pivot
+ *	flags and of TXN_DTL_SICHECKED serializes.
+ */
+#define	TXN_SI_PAST_CHECK(td)						\
+	((td)->status == TXN_COMMITTED ||				\
+	    ((td)->status == TXN_RUNNING && F_ISSET(td, TXN_DTL_SICHECKED)))
 
 /*
  * DB_TXNMGR --
@@ -143,6 +180,42 @@ struct __db_txnmgr {
 	ENV	*env;			/* Environment. */
 	REGINFO	 reginfo;		/* Region information. */
 };
+
+/*
+ * NOTE ON THE ENVIRONMENT BUILD SIGNATURE
+ *
+ * src/env/env_sig.c hashes sizeof(struct __db_txnmgr) into the environment build
+ * signature, and src/env/env_region.c refuses to ATTACH an existing environment
+ * whose stored signature differs:
+ *
+ *	"BDB1539 Build signature doesn't match environment" -> DB_VERSION_MISMATCH
+ *
+ * So changing this struct's size makes every previously-created environment
+ * unattachable, and abidiff CANNOT see it: this struct is not part of the public
+ * ABI, so sizeof(DB / DBC / DB_ENV / DB_TXN) do not move and the CI ABI gate
+ * stays green.  Adding a field here is a THREE-gate question -- public ABI,
+ * region layout (majver/minver), and this signature.
+ *
+ * There is deliberately NO compile-time size assertion here, unlike
+ * struct __db_mpool in mp.h.  Two forms were tried and both were wrong:
+ *   - "18 * sizeof(void *)" is true only on LP64.  This struct embeds REGINFO by
+ *     value and has fixed-width members, so it is not a clean pointer multiple;
+ *     that broke the 32-bit and Windows builds.  (mp.h gets away with the
+ *     pointer-unit form only because struct __db_mpool's members happen to all be
+ *     pointer-width -- correct by luck of composition, not by design.)
+ *   - A sum of member sizeofs is worse still: naming TAILQ_HEAD(tag, __db_txn)
+ *     inside sizeof declares a NEW struct tag instead of referring to the
+ *     member's type, silently yielding a different size.
+ *   - A literal byte count cannot be portable either, because db_mutex_t is
+ *     db_size_t or uintptr_t depending on mutex support (db.h), so the size
+ *     legitimately differs between platforms with the same word size.
+ *
+ * The signature is instead verified where it can be checked meaningfully: the
+ * "region signature" CI gate compares dist/env_sig_print.sh across the merge
+ * base, on one platform, where a like-for-like comparison is possible.  If you
+ * change this struct, expect that gate to fail and say so explicitly in the
+ * commit.
+ */
 
 /* Macros to lock/unlock the transaction region as a whole. */
 #define	TXN_SYSTEM_LOCK(env)						\

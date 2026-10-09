@@ -589,6 +589,7 @@ proc r { args } {
 			env -
 			lock -
 			log -
+			logverify -
 			memp -
 			multi_repmgr -
 			mutex -
@@ -845,6 +846,20 @@ proc r { args } {
 						sindex 0 1
 						sijoin 0 1
 					}
+				}
+			}
+			statprint {
+				if { $display } { puts "eval statprint001" }
+				if { $run } {
+					check_handles
+					eval statprint001
+				}
+			}
+			mvcc {
+				if { $display } { puts "eval mvcc001" }
+				if { $run } {
+					check_handles
+					eval mvcc001
 				}
 			}
 			btree -

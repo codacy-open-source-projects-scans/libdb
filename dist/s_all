@@ -19,8 +19,8 @@ sh s_php                # PHP config files
 sh s_include		# standard include files.
 
 sh s_java		# Java support.
-sh s_csharp		# Csharp support.
 sh s_test		# Test suite support.
+sh s_execbits		# Test script exec bits (verify; s_perm sets them).
 #sh s_tags		# Tags files.
 
 #############################################################
@@ -33,7 +33,6 @@ sh s_test		# Test suite support.
 # Create the build environments last, they use files created
 # by previous steps.
 #############################################################
-sh s_vxworks		# VxWorks support.
 sh s_windows		# Windows support.
 sh s_windows_dsp	# Windows support: build environment.
 sh s_android            # Android support: drop-in build environment.

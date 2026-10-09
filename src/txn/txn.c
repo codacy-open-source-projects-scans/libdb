@@ -48,10 +48,60 @@
 #include "dbinc/mp.h"
 #include "dbinc/txn.h"
 
+#ifdef HAVE_DST
+#include "sim_inject.h"			/* DST planted-bug harness. */
+#endif
+
+#ifdef DIAGNOSTIC
+/*
+ * __txn_ssi_crash --
+ *	DIAGNOSTIC-ONLY crash hook for the SSI commit-window durability test
+ *	(test/isolation/test_ssi_crash_pivot.c).  Cahill's SSI has no crash
+ *	model: the pivot check is a live-execution argument, so the question "can
+ *	a pivot become DURABLE because the crash landed inside its commit
+ *	window?" is not answered by the algorithm, and it cannot be asked from
+ *	userspace -- the interesting points (pivot decided but TXN_DTL_SICHECKED
+ *	not yet published; check done, commit record not yet written; commit
+ *	record written and flushed) are all INSIDE one library call.
+ *
+ *	When SSI_CRASH_AT names a point and this transaction is the marked victim
+ *	(DB_TXN->set_name("ssi-pivot")), the process dies right there with
+ *	SIGKILL: no atexit, no unwinding, no flush, exactly as a power loss.
+ *
+ *	Compiles to NOTHING outside --enable-diagnostic, and even in a diagnostic
+ *	build it is inert unless BOTH the env var is set AND the transaction was
+ *	explicitly named.  Production builds are unaffected.
+ */
+static void
+__txn_ssi_crash(txn, point)
+	DB_TXN *txn;
+	int point;
+{
+	char *v;
+
+	if (txn->name == NULL || strcmp(txn->name, "ssi-pivot") != 0)
+		return;
+	if ((v = getenv("SSI_CRASH_AT")) == NULL || atoi(v) != point)
+		return;
+	(void)fprintf(stderr, "[child] SSI_CRASH_AT=%d reached, SIGKILL\n",
+	    point);
+	(void)fflush(stderr);
+	(void)raise(SIGKILL);
+}
+#define	SSI_CRASH_POINT(txn, n)	__txn_ssi_crash(txn, n)
+#else
+#define	SSI_CRASH_POINT(txn, n)	NOP_STATEMENT
+#endif
+
 #define	LOG_FLAGS(txn)						\
 		(DB_LOG_COMMIT | (F_ISSET(txn, TXN_SYNC) ?	\
 		DB_FLUSH : (F_ISSET(txn, TXN_WRITE_NOSYNC) ?	\
 		DB_LOG_WRNOSYNC : 0)))
+
+/*
+ * SI_CLEANUP_TRIGGER_DIV lives in dbinc/lock.h: it bounds a lock-region
+ * population, and DB_ENV->lock_stat_print reports the ceiling it implies.
+ */
 
 /*
  * __txn_isvalid enumerated types.  We cannot simply use the transaction
@@ -106,7 +156,8 @@ __txn_begin_pp(dbenv, parent, txnpp, flags)
 	if ((ret = __db_fchk(env,
 	    "txn_begin", flags,
 	    DB_IGNORE_LEASE |DB_READ_COMMITTED | DB_READ_UNCOMMITTED |
-	    DB_TXN_FAMILY | DB_TXN_NOSYNC | DB_TXN_SNAPSHOT | DB_TXN_SYNC |
+	    DB_TXN_FAMILY | DB_TXN_NOSYNC | DB_TXN_SERIALIZABLE |
+	    DB_TXN_SNAPSHOT | DB_TXN_SYNC |
 	    DB_TXN_WAIT | DB_TXN_WRITE_NOSYNC | DB_TXN_NOWAIT |
 	    DB_TXN_BULK)) != 0)
 		return (ret);
@@ -121,7 +172,9 @@ __txn_begin_pp(dbenv, parent, txnpp, flags)
 		    "Family transactions cannot have parents"));
 		return (EINVAL);
 	} else if (IS_REAL_TXN(parent) &&
-	    !F_ISSET(parent, TXN_SNAPSHOT) && LF_ISSET(DB_TXN_SNAPSHOT)) {
+	    ((!F_ISSET(parent, TXN_SNAPSHOT) && LF_ISSET(DB_TXN_SNAPSHOT)) ||
+	    (!F_ISSET(parent, TXN_SNAPSHOT_SAFE) &&
+	    LF_ISSET(DB_TXN_SERIALIZABLE)))) {
 		__db_errx(env, DB_STR("4522",
 		    "Child transaction snapshot setting must match parent"));
 		return (EINVAL);
@@ -226,7 +279,26 @@ __txn_begin(env, ip, parent, txnpp, flags)
 		F_SET(txn, TXN_READ_UNCOMMITTED);
 	if (LF_ISSET(DB_TXN_FAMILY))
 		F_SET(txn, TXN_FAMILY | TXN_INFAMILY | TXN_READONLY);
-	if (LF_ISSET(DB_TXN_SNAPSHOT) || F_ISSET(dbenv, DB_ENV_TXN_SNAPSHOT) ||
+	/*
+	 * Establish the isolation level:
+	 *
+	 *   DB_TXN_SNAPSHOT     => plain snapshot isolation (MVCC substrate
+	 *                          only, TXN_SNAPSHOT).  May exhibit the
+	 *                          classic SI anomalies (write skew, the
+	 *                          read-only-transaction anomaly), exactly as
+	 *                          legacy Berkeley DB behaved.
+	 *
+	 *   DB_TXN_SERIALIZABLE => serializable snapshot isolation (SSI): the
+	 *                          snapshot substrate PLUS Cahill rw-conflict
+	 *                          detection (TXN_SNAPSHOT | TXN_SNAPSHOT_SAFE).
+	 *
+	 * A child inherits its parent's level; the env-wide defaults
+	 * DB_ENV_TXN_SNAPSHOT / DB_ENV_TXN_SERIALIZABLE supply it when neither
+	 * a flag nor a parent does.  DB_TXN_SERIALIZABLE implies the snapshot
+	 * substrate, so it also triggers the rep-client guard below.
+	 */
+	if (LF_ISSET(DB_TXN_SNAPSHOT | DB_TXN_SERIALIZABLE) ||
+	    F_ISSET(dbenv, DB_ENV_TXN_SNAPSHOT | DB_ENV_TXN_SERIALIZABLE) ||
 	    (parent != NULL && F_ISSET(parent, TXN_SNAPSHOT))) {
 		if (IS_REP_CLIENT(env)) {
 			__db_errx(env, DB_STR("4572",
@@ -234,6 +306,60 @@ __txn_begin(env, ip, parent, txnpp, flags)
 			return (EINVAL);
 		} else
 			F_SET(txn, TXN_SNAPSHOT);
+	}
+	/*
+	 * SSI (serializable snapshot isolation) layers rw-antidependency
+	 * tracking on top of the snapshot substrate.  Turn it on only when the
+	 * caller explicitly asked for serializability -- via DB_TXN_SERIALIZABLE,
+	 * the DB_ENV_TXN_SERIALIZABLE env default, or a SERIALIZABLE parent.
+	 * Plain DB_TXN_SNAPSHOT gets none of it.  (TXN_SNAPSHOT is already set
+	 * above for these transactions, and a replication client has already
+	 * returned EINVAL.)
+	 */
+	if (LF_ISSET(DB_TXN_SERIALIZABLE) ||
+	    F_ISSET(dbenv, DB_ENV_TXN_SERIALIZABLE) ||
+	    (parent != NULL && F_ISSET(parent, TXN_SNAPSHOT_SAFE))) {
+		F_SET(txn, TXN_SNAPSHOT_SAFE);
+		/*
+		 * SSI: committed readers' SIREAD markers persist until GC, which
+		 * otherwise runs only at checkpoint -- so between checkpoints the
+		 * marker count (and the committed-reader locker/detail structs it
+		 * pins) can grow until the next sweep, exhausting the statically
+		 * sized lock region in a long-lived process with no checkpoint
+		 * (a pure read-only SSI workload writes nothing, so checkpoint
+		 * never runs).  Bound it with a pressure trigger at txn_begin:
+		 * when the live-marker count crosses a fraction of the currently
+		 * allocated lock objects, run the best-effort sweep now, before we
+		 * begin (and allocate more).  No region lock is held here, so
+		 * __lock_sicleanup's txn-system-lock-first ordering is respected.
+		 */
+		if (parent == NULL && LOCKING_ON(env)) {
+			DB_LOCKREGION *lkreg =
+			    env->lk_handle->reginfo.primary;
+			/*
+			 * The sweep fires when live SIREAD markers pass
+			 * st_objects / SI_CLEANUP_TRIGGER_DIV, so the
+			 * committed-reader footprint is a bounded sawtooth whose
+			 * ceiling is that fraction of the lock-object table --
+			 * independent of transaction count.  The sweep also
+			 * reclaims the committed-reader locker and detail structs
+			 * the markers were pinning (__lock_sireap_lockers /
+			 * __txn_reap_si_details), so those do not accumulate
+			 * either.  st_objects is always non-zero, so the bound
+			 * holds whether or not a max is configured.
+			 *
+			 * Divisor 8 (rather than 2) keeps the steady state low:
+			 * measured on a read-only SSI soak it lowers the ceiling
+			 * ~4x AND runs the common path faster, because a shorter
+			 * sireaders list is cheaper to walk per lock_get and a
+			 * smaller marker population is cheaper to sweep -- the
+			 * more-frequent sweep more than pays for itself.
+			 */
+			u_int32_t nobj = lkreg->stat.st_objects;
+			if (nobj != 0 && atomic_read_relaxed(&lkreg->nsireaders) >
+			    nobj / SI_CLEANUP_TRIGGER_DIV)
+				(void)__lock_sicleanup(env);
+		}
 	}
 	if (LF_ISSET(DB_IGNORE_LEASE))
 		F_SET(txn, TXN_IGNORE_LEASE);
@@ -427,6 +553,17 @@ __txn_begin_int(txn)
 	td->xa_ref = 1;
 	td->xa_br_status = TXN_XA_IDLE;
 
+	/*
+	 * SSI: no SIREAD markers reference this detail yet.  This must be
+	 * initialized under TXN_SYSTEM_LOCK and *before* the detail is placed
+	 * on the active-transaction list below: TXN_DETAIL is allocated from
+	 * region memory without guaranteed zeroing, and concurrent walkers of
+	 * the active list (lock-manager conflict flagging, checkpoint marker
+	 * reclaim, stats) read si_ref.  Publishing the detail before setting
+	 * this field lets them observe garbage.
+	 */
+	atomic_init(&td->si_ref, 0);
+
 	/* Place transaction on active transaction list. */
 	SH_TAILQ_INSERT_HEAD(&region->active_txn, td, links, __txn_detail);
 	region->curtxns++;
@@ -450,6 +587,10 @@ __txn_begin_int(txn)
 	if (LOCKING_ON(env) && (ret =
 		__lock_getlocker(env->lk_handle, id, 1, &txn->locker)) != 0)
 			goto err;
+
+	/* SSI: link the locker to its transaction detail. */
+	if (txn->locker != NULL)
+		txn->locker->td_off = R_OFFSET(&mgr->reginfo, td);
 
 	txn->abort = __txn_abort_pp;
 	txn->commit = __txn_commit_pp;
@@ -679,6 +820,53 @@ __txn_commit(txn, flags)
 		goto err;
 	}
 
+	/*
+	 * SSI: a snapshot-safe transaction that became the pivot of a dangerous
+	 * structure (both the read end and the write end of rw-conflicts, i.e.
+	 * has both TXN_DTL_RCONF and TXN_DTL_WCONF) cannot commit -- doing so
+	 * could produce a non-serializable schedule.
+	 *
+	 * The pivot flags are set on td by concurrent writers in the lock
+	 * manager and in mpool, which serialize their flag writes on the
+	 * txn-region mutex (see __lock_get_internal, __memp_si_rwconflict).
+	 * Read both flags under that mutex so the two-flag test is atomic with
+	 * respect to a writer recording our second conflict edge.
+	 *
+	 * This is our ONLY pivot check: everything below (cursor close, lease
+	 * check, log write) is past the point where aborting on a late edge
+	 * would be correct, and __txn_end does not publish TXN_COMMITTED until
+	 * much later.  So, in the same critical section, publish
+	 * TXN_DTL_SICHECKED: it tells a writer that arrives during that whole
+	 * span that this transaction will not look at its pivot flags again, so
+	 * the writer must resolve the edge itself (abort with
+	 * DB_SNAPSHOT_UNSAFE) rather than defer to a check that has already
+	 * happened.  Without it a writer treats us as "still running, already
+	 * flagged, it will abort at its check" and both transactions commit a
+	 * write skew (issue #136).
+	 *
+	 * Only a snapshot-safe txn is examined by those writers, so nothing is
+	 * published for the ordinary path.
+	 */
+	if (F_ISSET(txn, TXN_SNAPSHOT_SAFE)) {
+		int is_pivot;
+		if (TXN_ON(env))
+			TXN_SYSTEM_LOCK(env);
+		is_pivot = F_ISSET(td, TXN_DTL_WCONF) &&
+		    F_ISSET(td, TXN_DTL_RCONF);
+		/* Crash point 1: pivot decided, SICHECKED not yet published. */
+		SSI_CRASH_POINT(txn, 1);
+		if (!is_pivot)
+			F_SET(td, TXN_DTL_SICHECKED);
+		if (TXN_ON(env))
+			TXN_SYSTEM_UNLOCK(env);
+		/* Crash point 2: check done, SICHECKED published. */
+		SSI_CRASH_POINT(txn, 2);
+		if (is_pivot) {
+			ret = DB_SNAPSHOT_CONFLICT;
+			goto err;
+		}
+	}
+
 	/* Close registered cursors before committing. */
 	if ((ret = __txn_close_cursors(txn)) != 0)
 		goto err;
@@ -788,12 +976,25 @@ __txn_commit(txn, flags)
 
 			if (ret == 0 && !IS_ZERO_LSN(td->last_lsn)) {
 				ret = __txn_flush_fe_files(txn);
+				/*
+				 * Crash point 3: read locks released, commit
+				 * record not yet written -- nothing durable.
+				 */
+				SSI_CRASH_POINT(txn, 3);
 				if (ret == 0)
 					ret = __txn_regop_log(env, txn,
 					    &td->visible_lsn, LOG_FLAGS(txn),
 					    TXN_COMMIT,
 					    (int32_t)time(NULL), id,
 					    request.obj);
+				/*
+				 * Crash point 4: the commit record is written and
+				 * (under DB_TXN_SYNC) flushed.  A transaction that
+				 * reaches here IS durable and recovery WILL redo
+				 * it -- which is precisely why a pivot must never
+				 * be allowed to get this far.
+				 */
+				SSI_CRASH_POINT(txn, 4);
 				if (ret == 0)
 					token_lsn = td->last_lsn =
 					    td->visible_lsn;
@@ -1141,8 +1342,26 @@ __txn_abort(txn)
 		    env, txn->locker, 0, &request, 1, NULL)) != 0)
 			return (__env_panic(env, ret));
 	}
-undo:	if ((ret = __txn_undo(txn)) != 0)
+undo:
+#if defined(HAVE_DST)
+#if DB_DST_BUG(4)
+	/*
+	 * PLANTED BUG ABORTNOUNDO (DB_DST_INJECT_BUG=4): skip the abort's
+	 * undo pass, so the aborting txn's dirty page changes are left in
+	 * place (never rolled back) yet the txn still reports aborted.  The
+	 * aborted records then survive; test_sim_abort_atomic's "aborted
+	 * txns leave no trace" invariant fires.  Compiled out of every
+	 * normal build.
+	 */
+	ret = 0;
+#else
+	if ((ret = __txn_undo(txn)) != 0)
 		return (__env_panic(env, ret));
+#endif
+#else
+	if ((ret = __txn_undo(txn)) != 0)
+		return (__env_panic(env, ret));
+#endif
 
 	/*
 	 * Normally, we do not need to log aborts.  However, if we
@@ -1263,6 +1482,25 @@ __txn_prepare(txn, gid)
 		goto err;
 	if (F_ISSET(txn, TXN_DEADLOCK)) {
 		ret = __db_txn_deadlock_err(env, txn);
+		goto err;
+	}
+
+	/*
+	 * SSI: serializable snapshot isolation is not yet compatible with
+	 * two-phase commit.  The pivot check that can abort an SSI transaction
+	 * runs at commit time, but a prepared transaction must be guaranteed
+	 * committable -- upstream panics the environment if a prepared txn
+	 * cannot commit (see __txn_commit's err: path).  An SSI txn can still
+	 * acquire a second rw-conflict edge (becoming a pivot) after prepare
+	 * and before the commit decision, which would turn that panic into a
+	 * reachable, environment-wide crash for any XA user.  Until SSI's
+	 * conflict status is frozen at prepare time, refuse the combination.
+	 */
+	if (F_ISSET(txn, TXN_SNAPSHOT_SAFE)) {
+		__db_errx(env, DB_STR("4575",
+		    "DB_TXN->prepare: DB_TXN_SERIALIZABLE (SSI) transactions "
+		    "cannot be prepared for two-phase commit"));
+		ret = EINVAL;
 		goto err;
 	}
 
@@ -1649,6 +1887,13 @@ __txn_end(txn, is_commit)
 		    (ret = __lock_getlocker(env->lk_handle,
 		    txn->txnid, 1, &txn->locker)) != 0)
 			return (__env_panic(env, ret));
+		/*
+		 * SSI: handle this txn's SIREAD markers before normal lock
+		 * release -- persist them on commit, drop them on abort.
+		 */
+		if (F_ISSET(txn, TXN_SNAPSHOT_SAFE) && (ret =
+		    __lock_sicommit(env, txn->locker, is_commit)) != 0)
+			return (__env_panic(env, ret));
 		request.op = txn->parent == NULL ||
 		    is_commit == 0 ? DB_LOCK_PUT_ALL : DB_LOCK_INHERIT;
 		request.obj = NULL;
@@ -1656,6 +1901,20 @@ __txn_end(txn, is_commit)
 		    txn->locker, 0, &request, 1, NULL)) != 0)
 			return (__env_panic(env, ret));
 	}
+
+	/*
+	 * Free the locker BEFORE the transaction detail (td): __lock_freelocker
+	 * reads td->si_ref (via the locker's td_off) to decide whether committed
+	 * SIREAD markers still reference the locker.  The detail is freed below
+	 * under TXN_SYSTEM_LOCK, so the locker must be released here, while td is
+	 * still alive -- otherwise __lock_freelocker_int dereferences a freed td
+	 * (a use-after-free on the OOM/abort cleanup path).  The locker lives in
+	 * its own lock domain (LOCK_LOCKERS), independent of TXN_SYSTEM_LOCK, so
+	 * releasing it here does not change lock ordering.
+	 */
+	if (LOCKING_ON(env) && (ret =
+	    __lock_freelocker(env->lk_handle, txn->locker)) != 0)
+		return (__env_panic(env, ret));
 
 	TXN_SYSTEM_LOCK(env);
 	td->status = is_commit ? TXN_COMMITTED : TXN_ABORTED;
@@ -1708,8 +1967,45 @@ __txn_end(txn, is_commit)
 				return (__env_panic(env, ret));
 	}
 
-	if (td != NULL)
-		__env_alloc_free(&mgr->reginfo, td);
+	if (td != NULL) {
+		if (atomic_read(&td->si_ref) == 0)
+			__env_alloc_free(&mgr->reginfo, td);
+		else {
+			/*
+			 * SSI: a committed snapshot-safe reader whose SIREAD
+			 * markers still reference this detail cannot be freed yet
+			 * (a marker's LOCK_OWNER dereferences it).  Keep it on the
+			 * mvcc_txn reclaim list, flagged TXN_DTL_SNAPSHOT, so the
+			 * marker GC (__lock_sicleanup) frees it when the last
+			 * marker goes -- rather than orphaning it off every list
+			 * (a leak) or freeing it early (a use-after-free).
+			 */
+			SH_TAILQ_INSERT_HEAD(&region->mvcc_txn,
+			    td, links, __txn_detail);
+			F_SET(td, TXN_DTL_SNAPSHOT);
+#ifdef HAVE_STATISTICS
+			/*
+			 * st_nsnapshot counts details parked on mvcc_txn, so it
+			 * must be incremented here too -- this is the second of
+			 * the two park sites (the mvcc_ref one above is the
+			 * first), and BOTH reap paths (__txn_reap_si_details,
+			 * __txn_remove_buffer) decrement it unconditionally.
+			 * Without this increment every committed SSI reader
+			 * decremented a count it never contributed to, and
+			 * st_nsnapshot underflowed past zero and wrapped (it is
+			 * u_int32_t), which made the one statistic an operator
+			 * would alarm on for issues #137/#138 read ~4.29e9.
+			 */
+			STAT_INC(env, txn,
+			    nsnapshot, region->stat.st_nsnapshot, txn->txnid);
+			if (region->stat.st_nsnapshot >
+			    region->stat.st_maxnsnapshot)
+				STAT_SET(env, txn, maxnsnapshot,
+				    region->stat.st_maxnsnapshot,
+				    region->stat.st_nsnapshot, txn->txnid);
+#endif
+		}
+	}
 
 #ifdef HAVE_STATISTICS
 	if (is_commit)
@@ -1727,13 +2023,6 @@ __txn_end(txn, is_commit)
 
 	TXN_SYSTEM_UNLOCK(env);
 
-	/*
-	 * The transaction cannot get more locks, remove its locker info,
-	 * if any.
-	 */
-	if (LOCKING_ON(env) && (ret =
-	    __lock_freelocker(env->lk_handle, txn->locker)) != 0)
-		return (__env_panic(env, ret));
 	if (txn->parent != NULL)
 		TAILQ_REMOVE(&txn->parent->kids, txn, klinks);
 

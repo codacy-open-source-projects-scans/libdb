@@ -11,8 +11,13 @@
 #include "db_int.h"
 #include "dbinc/db_page.h"		/* Required for diagnostic code. */
 #include "dbinc/mp.h"
+#include "dbinc/os_aio.h"
 #include "dbinc/log.h"
 #include "dbinc/txn.h"
+
+#ifdef HAVE_DST
+#include "sim_inject.h"			/* DST planted-bug harness. */
+#endif
 
 static int __memp_pgwrite
 	       __P((ENV *, DB_MPOOLFILE *, DB_MPOOL_HASH *, BH *));
@@ -300,87 +305,57 @@ err:	return (ret);
 }
 
 /*
- * __memp_pgwrite --
- *	Write a page to a file.
+ * __memp_pgwrite_prep --
+ *	Everything before the page write: WAL flush, write-ahead verification,
+ *	backup coordination, and pgout.  On return *do_iop is set if there is a
+ *	page image (c->buf) to write; otherwise the caller skips the I/O and
+ *	calls __memp_pgwrite_finish directly.  Returns 0 or an errno.
  */
 static int
-__memp_pgwrite(env, dbmfp, hp, bhp)
+__memp_pgwrite_prep(env, dbmfp, hp, bhp, c, do_iop)
 	ENV *env;
 	DB_MPOOLFILE *dbmfp;
 	DB_MPOOL_HASH *hp;
 	BH *bhp;
+	MEMP_PGW *c;
+	int *do_iop;
 {
 	DB_LSN lsn;
-	MPOOLFILE *mfp;
-	size_t nw;
 	int ret;
-	void * buf;
 
-	/*
-	 * Since writing does not require exclusive access, another thread
-	 * could have already written this buffer.
-	 */
+	memset(c, 0, sizeof(*c));
+	c->env = env;
+	c->dbmfp = dbmfp;
+	c->hp = hp;
+	c->bhp = bhp;
+	*do_iop = 0;
+
+	/* Another thread could have already written this buffer. */
 	if (!F_ISSET(bhp, BH_DIRTY))
 		return (0);
 
-	mfp = dbmfp == NULL ? NULL : dbmfp->mfp;
+	c->mfp = dbmfp == NULL ? NULL : dbmfp->mfp;
 	ret = 0;
-	buf = NULL;
 
 	/* We should never be called with a frozen or trashed buffer. */
 	DB_ASSERT(env, !F_ISSET(bhp, BH_FROZEN | BH_TRASH));
 
-	/*
-	 * It's possible that the underlying file doesn't exist, either
-	 * because of an outright removal or because it was a temporary
-	 * file that's been closed.
-	 *
-	 * !!!
-	 * Once we pass this point, we know that dbmfp and mfp aren't NULL,
-	 * and that we have a valid file reference.
-	 */
-	if (mfp == NULL || mfp->deadfile)
-		goto file_dead;
+	/* The underlying file may not exist; finish discards the dirty page. */
+	if (c->mfp == NULL || c->mfp->deadfile)
+		return (0);
 
-	/*
-	 * If the page is in a file for which we have LSN information, we have
-	 * to ensure the appropriate log records are on disk.
-	 */
-	if (LOGGING_ON(env) && mfp->lsn_off != DB_LSN_OFF_NOTSET &&
+	/* Ensure the page's log records are on disk (WAL). */
+	if (LOGGING_ON(env) && c->mfp->lsn_off != DB_LSN_OFF_NOTSET &&
 	    !IS_CLIENT_PGRECOVER(env)) {
-		memcpy(&lsn, bhp->buf + mfp->lsn_off, sizeof(DB_LSN));
+		memcpy(&lsn, bhp->buf + c->mfp->lsn_off, sizeof(DB_LSN));
 		if (!IS_NOT_LOGGED_LSN(lsn) &&
 		    (ret = __log_flush(env, &lsn)) != 0)
-			goto err;
+			return (ret);
 	}
 
 #ifdef DIAGNOSTIC
-	/*
-	 * Verify write-ahead logging semantics.
-	 *
-	 * !!!
-	 * Two special cases.  There is a single field on the meta-data page,
-	 * the last-page-number-in-the-file field, for which we do not log
-	 * changes.  If the page was originally created in a database that
-	 * didn't have logging turned on, we can see a page marked dirty but
-	 * for which no corresponding log record has been written.  However,
-	 * the only way that a page can be created for which there isn't a
-	 * previous log record and valid LSN is when the page was created
-	 * without logging turned on, and so we check for that special-case
-	 * LSN value.
-	 *
-	 * Second, when a client is reading database pages from a master
-	 * during an internal backup, we may get pages modified after
-	 * the current end-of-log.
-	 */
 	if (LOGGING_ON(env) && !IS_NOT_LOGGED_LSN(LSN(bhp->buf)) &&
 	    !IS_CLIENT_PGRECOVER(env)) {
-		/*
-		 * There is a potential race here.  If we are in the midst of
-		 * switching log files, it's possible we could test against the
-		 * old file and the new offset in the log region's LSN.  If we
-		 * fail the first test, acquire the log mutex and check again.
-		 */
 		DB_LOG *dblp;
 		LOG *lp;
 
@@ -397,99 +372,382 @@ __memp_pgwrite(env, dbmfp, hp, bhp)
 #endif
 
 #ifndef HAVE_ATOMICFILEREAD
-	if (mfp->backup_in_progress != 0) {
-		MUTEX_READLOCK(env, mfp->mtx_write);
-		if (bhp->pgno >= mfp->low_pgno && bhp->pgno <= mfp->high_pgno) {
-			MUTEX_UNLOCK(env, mfp->mtx_write);
-			ret = EAGAIN;
-			goto err;
+	if (c->mfp->backup_in_progress != 0) {
+		MUTEX_READLOCK(env, c->mfp->mtx_write);
+		if (bhp->pgno >= c->mfp->low_pgno &&
+		    bhp->pgno <= c->mfp->high_pgno) {
+			MUTEX_UNLOCK(env, c->mfp->mtx_write);
+			return (EAGAIN);
 		}
-		atomic_inc(env, &mfp->writers);
-		MUTEX_UNLOCK(env, mfp->mtx_write);
-	} else
-		atomic_inc(env, &mfp->writers);
+		atomic_inc(env, &c->mfp->writers);
+		c->writers_inced = 1;
+		MUTEX_UNLOCK(env, c->mfp->mtx_write);
+	} else {
+		atomic_inc(env, &c->mfp->writers);
+		c->writers_inced = 1;
+	}
 #endif
 
 	/*
-	 * Call any pgout function.  If we have the page exclusive then
-	 * we are going to reuse it otherwise make a copy of the page so
-	 * that others can continue looking at the page while we write it.
+	 * Call any pgout function.  With the page exclusive we reuse it;
+	 * otherwise copy it so others can read it while we write.
 	 */
-	buf = bhp->buf;
-	if (mfp->ftype != 0) {
+	c->buf = bhp->buf;
+	if (c->mfp->ftype != 0) {
 		if (F_ISSET(bhp, BH_EXCLUSIVE))
 			F_SET(bhp, BH_TRASH);
 		else {
-			if ((ret = __os_malloc(env, mfp->pagesize, &buf)) != 0)
-				goto err;
-			memcpy(buf, bhp->buf, mfp->pagesize);
+			if ((ret =
+			    __os_malloc(env, c->mfp->pagesize, &c->buf)) != 0) {
+				c->buf = NULL;
+				return (ret);
+			}
+			memcpy(c->buf, bhp->buf, c->mfp->pagesize);
 		}
-		if ((ret = __memp_pg(dbmfp, bhp->pgno, buf, 0)) != 0)
-			goto err;
+		if ((ret = __memp_pg(dbmfp, bhp->pgno, c->buf, 0)) != 0)
+			return (ret);
 	}
 
-	PERFMON3(env, mpool, write, __memp_fn(dbmfp), bhp->pgno, bhp);
-	/* Write the page. */
-	if ((ret = __os_io(env, DB_IO_WRITE, dbmfp->fhp, bhp->pgno,
-	    mfp->pagesize, 0, mfp->pagesize, buf, &nw)) != 0) {
+	*do_iop = 1;
+	return (0);
+}
+
+/*
+ * __memp_pgwrite_finish --
+ *	Everything after the page write: release the backup-writer count and
+ *	page-image copy, update statistics on a successful write, and clear
+ *	BH_DIRTY/BH_TRASH under the hash-bucket latch.  "did_io" is set if a
+ *	write was actually issued; "io_ret" is its result (0 on success).
+ */
+static int
+__memp_pgwrite_finish(c, did_io, io_ret)
+	MEMP_PGW *c;
+	int did_io;
+	int io_ret;
+{
+	ENV *env;
+	BH *bhp;
+	DB_MPOOL_HASH *hp;
+	int ret;
+
+	env = c->env;
+	bhp = c->bhp;
+	hp = c->hp;
+	ret = io_ret;
+
 #ifndef HAVE_ATOMICFILEREAD
-		atomic_dec(env, &mfp->writers);
+	if (c->writers_inced)
+		atomic_dec(env, &c->mfp->writers);
 #endif
-		__db_errx(env, DB_STR_A("3015",
-		    "%s: write failed for page %lu", "%s %lu"),
-		    __memp_fn(dbmfp), (u_long)bhp->pgno);
-		goto err;
-	}
-#ifndef HAVE_ATOMICFILEREAD
-	atomic_dec(env, &mfp->writers);
-#endif
-	STAT_INC_VERB(env, mpool, page_out,
-	    mfp->stat.st_page_out, __memp_fn(dbmfp), bhp->pgno);
-	if (bhp->pgno > mfp->last_flushed_pgno) {
-		MUTEX_LOCK(env, mfp->mutex);
-		if (bhp->pgno > mfp->last_flushed_pgno)
-			mfp->last_flushed_pgno = bhp->pgno;
-		MUTEX_UNLOCK(env, mfp->mutex);
+
+	if (did_io && ret == 0 && c->mfp != NULL) {
+		STAT_INC_VERB(env, mpool, page_out,
+		    c->mfp->stat.st_page_out, __memp_fn(c->dbmfp), bhp->pgno);
+		if (bhp->pgno > c->mfp->last_flushed_pgno) {
+			MUTEX_LOCK(env, c->mfp->mutex);
+			if (bhp->pgno > c->mfp->last_flushed_pgno)
+				c->mfp->last_flushed_pgno = bhp->pgno;
+			MUTEX_UNLOCK(env, c->mfp->mutex);
+		}
 	}
 
-err:
-file_dead:
-	if (buf != NULL && buf != bhp->buf)
-		__os_free(env, buf);
-	/*
-	 * !!!
-	 * Once we pass this point, dbmfp and mfp may be NULL, we may not have
-	 * a valid file reference.
-	 */
+	if (c->buf != NULL && c->buf != bhp->buf)
+		__os_free(env, c->buf);
 
 	/*
-	 * Update the hash bucket statistics, reset the flags.  If we were
-	 * successful, the page is no longer dirty.  Someone else may have
-	 * also written the page so we need to latch the hash bucket here
-	 * to get the accounting correct.  Since we have the buffer
-	 * shared it cannot be marked dirty again till we release it.
-	 * This is the only place we update the flags field only holding
-	 * a shared latch.
+	 * Update the hash bucket statistics, reset the flags.  On success the
+	 * page is no longer dirty.  We latch the hash bucket because this is
+	 * the only place the flags are updated holding only a shared latch.
 	 */
 	if (F_ISSET(bhp, BH_DIRTY | BH_TRASH)) {
 		MUTEX_LOCK(env, hp->mtx_hash);
 		DB_ASSERT(env, !SH_CHAIN_HASNEXT(bhp, vc));
 		if (ret == 0 && F_ISSET(bhp, BH_DIRTY)) {
 			F_CLR(bhp, BH_DIRTY | BH_DIRTY_CREATE);
-			DB_ASSERT(env, atomic_read(&hp->hash_page_dirty) > 0);
+			DB_ASSERT(env, atomic_read_relaxed(&hp->hash_page_dirty) > 0);
 			atomic_dec(env, &hp->hash_page_dirty);
 		}
 
 		/* put the page back if necessary. */
 		if ((ret != 0 || BH_REFCOUNT(bhp) > 1) &&
 		    F_ISSET(bhp, BH_TRASH)) {
-			ret = __memp_pg(dbmfp, bhp->pgno, bhp->buf, 1);
+			ret = __memp_pg(c->dbmfp, bhp->pgno, bhp->buf, 1);
 			F_CLR(bhp, BH_TRASH);
 		}
 		MUTEX_UNLOCK(env, hp->mtx_hash);
 	}
 
 	return (ret);
+}
+
+/*
+ * __memp_pgwrite --
+ *	Write a page to a file.
+ */
+static int
+__memp_pgwrite(env, dbmfp, hp, bhp)
+	ENV *env;
+	DB_MPOOLFILE *dbmfp;
+	DB_MPOOL_HASH *hp;
+	BH *bhp;
+{
+	MEMP_PGW c;
+	size_t nw;
+	int did_io, do_io, ret;
+
+	ret = __memp_pgwrite_prep(env, dbmfp, hp, bhp, &c, &do_io);
+	did_io = 0;
+	if (ret == 0 && do_io) {
+		PERFMON3(env, mpool, write, __memp_fn(dbmfp), bhp->pgno, bhp);
+		did_io = 1;
+#if defined(HAVE_DST)
+#if DB_DST_BUG(3)
+		/*
+		 * PLANTED BUG LOSTUPDATE (DB_DST_INJECT_BUG=3): skip the page
+		 * write but report success, so __memp_pgwrite_finish clears
+		 * BH_DIRTY as if the page reached disk.  A checkpoint then
+		 * believes this dirty page is durable when it is not; after a
+		 * crash, recovery trusts the checkpoint and the update is lost.
+		 * test_sim_ckp_crash's "post-checkpoint committed data survives"
+		 * invariant fires.  Compiled out of every normal build.
+		 */
+		nw = c.mfp->pagesize;
+		ret = 0;
+#else
+		if ((ret = __os_io(env, DB_IO_WRITE, dbmfp->fhp, bhp->pgno,
+		    c.mfp->pagesize, 0, c.mfp->pagesize, c.buf, &nw)) != 0)
+			__db_errx(env, DB_STR_A("3015",
+			    "%s: write failed for page %lu", "%s %lu"),
+			    __memp_fn(dbmfp), (u_long)bhp->pgno);
+#endif
+#else
+		if ((ret = __os_io(env, DB_IO_WRITE, dbmfp->fhp, bhp->pgno,
+		    c.mfp->pagesize, 0, c.mfp->pagesize, c.buf, &nw)) != 0)
+			__db_errx(env, DB_STR_A("3043",
+			    "%s: write failed for page %lu", "%s %lu"),
+			    __memp_fn(dbmfp), (u_long)bhp->pgno);
+#endif
+	}
+	return (__memp_pgwrite_finish(&c, did_io, ret));
+}
+
+/*
+ * __memp_aio_writeback_done --
+ *	os_aio completion callback for an async checkpoint write.  Records the
+ *	result only; the finish + reference release run in the reaping thread
+ *	(via __memp_aio_drain), so no latches are taken in this callback.
+ */
+static void
+__memp_aio_writeback_done(env, cookie, io_ret)
+	ENV *env;
+	void *cookie;
+	int io_ret;
+{
+	MEMP_AIO_W *w;
+
+	COMPQUIET(env, NULL);
+	w = cookie;
+	w->io_ret = io_ret;
+	w->done = 1;
+}
+
+/*
+ * __memp_aio_writeback_finish --
+ *	Complete one async checkpoint write: run the shared page-write finish,
+ *	then release the held file-handle reference (mirrors __memp_bhwrite's
+ *	tail; opened is always 0 on the async fast path).
+ */
+static int
+__memp_aio_writeback_finish(dbmp, w)
+	DB_MPOOL *dbmp;
+	MEMP_AIO_W *w;
+{
+	DB_MPOOLFILE *dbmfp;
+	ENV *env;
+	MPOOLFILE *mfp;
+	int ret;
+
+	env = dbmp->env;
+	ret = __memp_pgwrite_finish(&w->ctx, 1, w->io_ret);
+
+	dbmfp = w->dbmfp;
+	mfp = dbmfp->mfp;
+	MUTEX_LOCK(env, dbmp->mutex);
+	if (!w->opened && dbmfp->ref == 1) {
+		if (!F_ISSET(dbmfp, MP_FLUSH)) {
+			F_SET(dbmfp, MP_FLUSH);
+			MUTEX_LOCK(env, mfp->mutex);
+			if (!F_ISSET(dbmfp, MP_FOR_FLUSH)) {
+				mfp->neutral_cnt++;
+				F_SET(dbmfp, MP_FOR_FLUSH);
+			}
+			MUTEX_UNLOCK(env, mfp->mutex);
+		}
+	} else
+		--dbmfp->ref;
+	MUTEX_UNLOCK(env, dbmp->mutex);
+	return (ret);
+}
+
+/*
+ * __memp_bhwrite_async --
+ *	Asynchronous variant of __memp_bhwrite for the checkpoint/sync path.
+ *	For the common case -- a durable, already-open file handle -- it
+ *	prepares the write and submits it via os_aio, holding the buffer pin
+ *	(the caller's ref + shared mtx_buf) and a file-handle reference until
+ *	completion; *deferredp is set and the caller must later reap via
+ *	__memp_aio_drain.  Dead/temporary/extent/unopened/read-only files and
+ *	the skip/error cases are handled synchronously here (*deferredp == 0).
+ *
+ * PUBLIC: int __memp_bhwrite_async __P((DB_MPOOL *, DB_MPOOL_HASH *,
+ * PUBLIC:     MPOOLFILE *, BH *, struct __db_aio_context *, MEMP_AIO_W *,
+ * PUBLIC:     int *));
+ */
+int
+__memp_bhwrite_async(dbmp, hp, mfp, bhp, aioc, w, deferredp)
+	DB_MPOOL *dbmp;
+	DB_MPOOL_HASH *hp;
+	MPOOLFILE *mfp;
+	BH *bhp;
+	struct __db_aio_context *aioc;
+	MEMP_AIO_W *w;
+	int *deferredp;
+{
+	DB_AIO_OP op;
+	DB_MPOOLFILE *dbmfp;
+	ENV *env;
+	size_t nw;
+	int do_io, ret;
+
+	env = dbmp->env;
+	*deferredp = 0;
+
+	/* Only an already-open durable handle takes the async fast path. */
+	if (mfp->deadfile)
+		return (__memp_bhwrite(dbmp, hp, mfp, bhp, 1));
+	MUTEX_LOCK(env, dbmp->mutex);
+	TAILQ_FOREACH(dbmfp, &dbmp->dbmfq, q)
+		if (dbmfp->mfp == mfp && !F_ISSET(dbmfp, MP_READONLY)) {
+			++dbmfp->ref;
+			break;
+		}
+	MUTEX_UNLOCK(env, dbmp->mutex);
+	if (dbmfp == NULL || dbmfp->fhp == NULL) {
+		if (dbmfp != NULL) {
+			MUTEX_LOCK(env, dbmp->mutex);
+			--dbmfp->ref;
+			MUTEX_UNLOCK(env, dbmp->mutex);
+		}
+		return (__memp_bhwrite(dbmp, hp, mfp, bhp, 1));
+	}
+
+	/* Prepare the write (WAL flush + pgout) into the slot's context. */
+	ret = __memp_pgwrite_prep(env, dbmfp, hp, bhp, &w->ctx, &do_io);
+	if (ret != 0 || !do_io) {
+		ret = __memp_pgwrite_finish(&w->ctx, 0, ret);
+		MUTEX_LOCK(env, dbmp->mutex);
+		--dbmfp->ref;
+		MUTEX_UNLOCK(env, dbmp->mutex);
+		return (ret);
+	}
+
+	w->bhp = bhp;
+	w->dbmfp = dbmfp;
+	w->opened = 0;
+	w->io_ret = 0;
+	w->done = 0;
+
+	op.op = DB_IO_WRITE;
+	op.fhp = dbmfp->fhp;
+	op.pgno = bhp->pgno;
+	op.pagesize = w->ctx.mfp->pagesize;
+	op.buf = w->ctx.buf;
+	op.cookie = w;
+	op.done = __memp_aio_writeback_done;
+	if ((ret = __os_aio_submit(env, aioc, &op)) != 0) {
+		/* Submit failed: complete the write synchronously. */
+		ret = __os_io(env, DB_IO_WRITE, dbmfp->fhp, bhp->pgno,
+		    op.pagesize, 0, op.pagesize, w->ctx.buf, &nw);
+		ret = __memp_pgwrite_finish(&w->ctx, 1, ret);
+		MUTEX_LOCK(env, dbmp->mutex);
+		--dbmfp->ref;
+		MUTEX_UNLOCK(env, dbmp->mutex);
+		return (ret);
+	}
+	*deferredp = 1;
+	return (0);
+}
+
+/*
+ * __memp_aio_drain --
+ *	Reap all "n" outstanding async checkpoint writes, run each completion
+ *	(BH_DIRTY clear + file-handle release), and release each buffer pin.
+ *	Returns the number of writes completed (n).  If any write FAILED, the
+ *	first non-zero error is stored through errp (if non-NULL) so the sync
+ *	caller can fail the checkpoint exactly as the synchronous path does --
+ *	a silently dropped async write is lost data / a false durable frontier.
+ *	The failed page is left BH_DIRTY by __memp_pgwrite_finish, so it is not
+ *	lost from cache and a later sync retries it.
+ *
+ *	The caller must hold aioc->mtx_aio, giving it exclusive use of the
+ *	context: reaping drains the backend's shared completion queue, so a
+ *	second concurrent submitter's completions could otherwise satisfy this
+ *	drain's count and we would "complete" our own still-in-flight writes.
+ *	We verify that rather than assume it -- every slot must have had its
+ *	completion callback run (w->done) before we finish it.  A slot that
+ *	comes back undone is a mis-attributed or lost completion: we must NOT
+ *	clear BH_DIRTY for it (that is precisely the false durable frontier),
+ *	so it is reported as an I/O error, failing this caller's checkpoint.
+ *
+ * PUBLIC: int __memp_aio_drain __P((ENV *, DB_MPOOL *,
+ * PUBLIC:     struct __db_aio_context *, MEMP_AIO_W *, int, int *));
+ */
+int
+__memp_aio_drain(env, dbmp, aioc, w, n, errp)
+	ENV *env;
+	DB_MPOOL *dbmp;
+	struct __db_aio_context *aioc;
+	MEMP_AIO_W *w;
+	int n;
+	int *errp;
+{
+	int got, j, t_ret;
+
+	/*
+	 * Reap until every one of our n ops has completed.  A reap that
+	 * returns 0 with nothing left in flight cannot make progress (a
+	 * completion was lost); stop rather than spin forever -- the
+	 * per-slot done check below turns it into an error.
+	 */
+	for (got = 0; got < n; ) {
+		if ((t_ret = __os_aio_reap(env, aioc, -1, 1)) == 0 &&
+		    aioc->inflight == 0)
+			break;
+		got += t_ret;
+	}
+	for (j = 0; j < n; j++) {
+		if (w[j].done)
+			t_ret = __memp_aio_writeback_finish(dbmp, &w[j]);
+		else {
+			/*
+			 * Never observed with the context's mtx_aio held; this
+			 * is the assertion that the exclusive-use discipline is
+			 * actually in force.  Report the write as failed so
+			 * the page stays dirty and the checkpoint fails.
+			 */
+			DB_ASSERT(env, w[j].done);
+			w[j].io_ret = EIO;
+			t_ret = __memp_aio_writeback_finish(dbmp, &w[j]);
+			if (t_ret == 0)
+				t_ret = EIO;
+		}
+		if (t_ret != 0 && errp != NULL && *errp == 0)
+			*errp = t_ret;
+		DB_ASSERT(env, atomic_read(&w[j].bhp->ref) > 0);
+		atomic_dec(env, &w[j].bhp->ref);
+		MUTEX_UNLOCK(env, w[j].bhp->mtx_buf);
+	}
+	return (n);
 }
 
 /*
@@ -590,6 +848,16 @@ __memp_bhfree(dbmp, infop, mfp, hp, bhp, flags)
 	if (mfp != NULL)
 		pagesize = mfp->pagesize;
 #endif
+
+	/*
+	 * If this buffer was wired and is being freed without going through
+	 * __db_free (e.g. file/env close discard), drop it from the region's
+	 * wired count.  The wired byte gates this so it is decremented once.
+	 */
+	if (bhp->wired != 0) {
+		bhp->wired = 0;
+		(void)atomic_dec(env, &((MPOOL *)infop->primary)->wired_pages);
+	}
 
 	DB_ASSERT(env, LF_ISSET(BH_FREE_UNLOCKED) ||
 	    (hp != NULL && MUTEX_IS_OWNED(env, hp->mtx_hash)));

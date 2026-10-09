@@ -75,7 +75,49 @@ struct __db_mpool {
 	 */
 	ENV	   *env;		/* Enclosing environment. */
 	REGINFO	   *reginfo;		/* Underlying cache regions. */
+
+	/*
+	 * Per-process asynchronous-I/O context for buffer-pool writeback
+	 * (checkpoint/sync).  NULL if no async backend is available, in which
+	 * case writeback is synchronous.  Owned by this process.
+	 *
+	 * The exclusive-use latch that serializes concurrent __memp_sync_int
+	 * callers on this context is ctx->mtx_aio, INSIDE the context (see
+	 * dbinc/os_aio.h), deliberately not a field here.  DB_MPOOL is a
+	 * process-private handle, but env_sig.c hashes sizeof(struct
+	 * __db_mpool) unconditionally into the build signature, and
+	 * __env_region_attach refuses any environment whose stored signature
+	 * differs ("BDB1539 Build signature doesn't match environment",
+	 * DB_VERSION_MISMATCH).  Growing this struct would therefore break
+	 * upgrade-in-place against an existing environment -- a break that
+	 * libabigail does not see, because no public type changes.  Keep new
+	 * per-process mpool state in a struct env_sig.c does not hash.
+	 */
+	struct __db_aio_context *aio_ctx;
 };
+
+/*
+ * DB_MPOOL's size feeds __env_struct_sig(), which __env_region_attach
+ * compares against the signature stored in an existing region: any change to
+ * this struct's size makes every previously-created environment unattachable
+ * with DB_VERSION_MISMATCH.  Pin it, so that failure surfaces at build time
+ * here instead of at a customer's region attach.  If you are intentionally
+ * breaking region compatibility, update these numbers in the same commit.
+ */
+/*
+ * DB_MPOOL's size feeds __env_struct_sig(), which __env_region_attach
+ * compares against the signature stored in an existing region: any change to
+ * this struct's size makes every previously-created environment unattachable
+ * with DB_VERSION_MISMATCH.  Pin it, so that failure surfaces at build time
+ * here instead of at a customer's region attach.  If you are intentionally
+ * breaking region compatibility, update this expression in the same commit.
+ *
+ * Negative-array-size idiom rather than _Static_assert: this header is
+ * compiled as C89 and as C++, by every supported compiler.
+ */
+#define	DB_MPOOL_SIG_SIZE	(8 * sizeof(void *))
+typedef char __db_mpool_size_is_signature_stable[
+    sizeof(struct __db_mpool) == DB_MPOOL_SIG_SIZE ? 1 : -1];
 
 /*
  * DB_MPREG --
@@ -179,14 +221,12 @@ struct __mpool { /* SHARED */
 	 * The htab and htab_buckets fields are not thread protected as they
 	 * are initialized during mpool creation, and not modified again.
 	 *
-	 * The last_checked, lru_priority, and lru_generation fields are thread
-	 * protected by the region lock.
+	 * The last_checked field (the CLOCK eviction hand) is thread protected
+	 * by the region lock.
 	 */
 	roff_t	  htab;			/* Hash table offset. */
 	u_int32_t htab_buckets;		/* Number of hash table entries. */
 	u_int32_t last_checked;		/* Last bucket checked for free. */
-	u_int32_t lru_priority;		/* Priority counter for buffer LRU. */
-	u_int32_t lru_generation;	/* Allocation race condition detector. */
 	u_int32_t htab_mutexes;		/* Number of hash mutexes per region. */
 
 	 /*
@@ -195,6 +235,15 @@ struct __mpool { /* SHARED */
 	  * without the lock to return statistics.
 	  */
 	u_int32_t pages;		/* Number of pages in the cache. */
+
+	/*
+	 * Count of buffers currently wired (non-evictable; B-tree internal
+	 * pages, Stage 1).  Atomic so __memp_wire/__memp_unwire need no region
+	 * lock.  Capped at MPOOL_WIRED_MAX_PCT of `pages` so wiring can never
+	 * starve the cache; over the cap, wiring is simply skipped (the descent
+	 * falls back to a normal pin).
+	 */
+	db_atomic_t wired_pages;
 
 	/*
 	 * The stat fields are not thread protected, and cannot be trusted.
@@ -367,17 +416,6 @@ struct __db_mpool_fstat_int { /* SHARED */
 };
 
 /*
- * The base mpool priority is 1/4th of the name space, or just under 2^30. When
- * the LRU priority counter is about to wrap (within a 128-entry 'red zone'
- * area) we adjust everybody down so that no one is larger than the new LRU
- * priority.
- */
-#define	MPOOL_LRU_MAX		UINT32_MAX
-#define	MPOOL_LRU_REDZONE	(MPOOL_LRU_MAX - 128)
-#define	MPOOL_LRU_BASE		(MPOOL_LRU_MAX / 4)
-#define	MPOOL_LRU_DECREMENT	(MPOOL_LRU_MAX - MPOOL_LRU_BASE)
-
-/*
  * Mpool priorities from low to high.  Defined in terms of fractions of the
  * buffers in the pool.
  */
@@ -387,6 +425,54 @@ struct __db_mpool_fstat_int { /* SHARED */
 #define	MPOOL_PRI_HIGH		10	/* With the dirty buffers. */
 #define	MPOOL_PRI_DIRTY		10	/* Dirty gets a 10% boost. */
 #define	MPOOL_PRI_VERY_HIGH	1	/* Add number of buffers in pool. */
+
+/*
+ * CLOCK / second-chance buffer "warmth" (scalability Stage 0).
+ *
+ * bhp->priority is reused as a small saturating warmth counter in the range
+ * [0, MPOOL_CLOCK_MAX].  A buffer access refills the warmth toward a level
+ * chosen from the access priority hint -- done read-first, so an already-warm
+ * (hot) buffer is not written at all, keeping the read path free of shared
+ * stores.  The eviction hand (__memp_alloc) decrements warmth as it sweeps and
+ * evicts a buffer once its warmth reaches 0 (second chance).
+ *
+ * This replaces the previous timestamp LRU, which wrote bhp->priority and
+ * advanced a shared c_mp->lru_priority counter on every __memp_fput, and swept
+ * the whole cache in __memp_reset_lru on wraparound.  It is also scan-resistant:
+ * bulk-scanned pages refill to a low warmth and age out before the hot set.
+ */
+#define	MPOOL_CLOCK_MAX		4	/* Sticky-hot ceiling. */
+#define	MPOOL_CLOCK_VERY_LOW	0
+#define	MPOOL_CLOCK_LOW		1
+#define	MPOOL_CLOCK_DEFAULT	2
+#define	MPOOL_CLOCK_HIGH	3
+#define	MPOOL_CLOCK_VERY_HIGH	MPOOL_CLOCK_MAX
+#define	MPOOL_CLOCK_DIRTY_BOOST	1	/* Dirty pages get +1 warmth. */
+
+/*
+ * Scan resistance (probationary admission + COOL-first eviction).
+ *
+ * Warmth is split into a COOL band [0, MPOOL_CLOCK_HOT) and a HOT band
+ * [MPOOL_CLOCK_HOT, MPOOL_CLOCK_MAX].  A freshly read/created buffer is
+ * admitted COOL (MPOOL_CLOCK_ADMIT); the access that read it climbs it one
+ * step, so a page touched only once (e.g. by a sequential scan) stays in the
+ * COOL band, while a re-referenced page crosses into the HOT band.
+ *
+ * The eviction hand ages and reclaims COOL-band buffers and leaves HOT-band
+ * buffers untouched, so a scan of any length -- which keeps supplying COOL
+ * victims -- never ages the hot working set.  HOT-band buffers are only cooled
+ * when a full sweep finds no COOL victim (the existing "aggressive" path).
+ */
+#define	MPOOL_CLOCK_HOT		MPOOL_CLOCK_DEFAULT	/* >= this is protected */
+#define	MPOOL_CLOCK_ADMIT	MPOOL_CLOCK_VERY_LOW	/* probationary warmth */
+
+/*
+ * Wiring cap (Stage 1): at most this percent of a cache region's buffers may
+ * be wired (held non-evictable for B-tree internal pages), so wiring can never
+ * starve the cache.  Over the cap, __memp_wire is a no-op and the descent uses
+ * a normal pin.
+ */
+#define	MPOOL_WIRED_MAX_PCT	25
 
 /*
  * MPOOLFILE --
@@ -552,6 +638,47 @@ struct __bh { /* SHARED */
 #define	BH_THAWED	0x100		/* Page was thawed. */
 	u_int16_t	flags;
 
+	/*
+	 * Stage 1: "wired" buffers are exempt from eviction (set for B-tree
+	 * internal/root pages so the optimistic descent can read them without
+	 * risk of the frame being reclaimed under it).  A dedicated byte, not a
+	 * flags bit: it is set with a plain monotonic store while the caller
+	 * holds only a shared buffer latch, so it must not share the non-atomic
+	 * RMW of the flags word (which __memp_pgwrite clears BH_DIRTY in under a
+	 * shared latch).  Reset to 0 wherever a buffer header is (re)initialized.
+	 */
+	u_int8_t	wired;
+
+	/*
+	 * RFC 0007 phase 1: frame generation, bumped whenever this frame is
+	 * taken exclusively (a writer dirties it, it is read in, it is frozen/
+	 * thawed, or it is reused by eviction).  An optimistic reader samples
+	 * (gen, pgno, mf_offset) before reading the page and re-samples after;
+	 * any change means the frame moved under it and the read is discarded.
+	 *
+	 * Occupies the 1-byte hole that used to sit here between `wired` and
+	 * the 4-byte-aligned `priority`, so sizeof(BH) is unchanged (96 on
+	 * LP64) and __env_struct_sig() -- which hashes struct __bh, see
+	 * env_sig.c -- is byte-identical.  That matters more than it looks:
+	 * a signature change makes env_region.c refuse to attach EVERY
+	 * existing environment (BDB1539 / DB_VERSION_MISMATCH) while abidiff
+	 * stays green, because BH is not public ABI.
+	 *
+	 * WRAP / ABA.  8 bits wraps after 256 exclusive acquisitions, which is
+	 * far too weak alone, so validation compares the FULL tuple
+	 * (gen, pgno, mf_offset) -- see BH_GEN_SAMPLE/BH_GEN_VALID.  A frame
+	 * that is reused must be re-inserted for the same page of the same
+	 * file to defeat that, so the residual is: exactly 256 (mod 256)
+	 * exclusive acquisitions, ending with the same (pgno, mf_offset), all
+	 * inside one reader's pre-validation window.
+	 *
+	 * Like `wired` this is a dedicated byte rather than flag bits: it is
+	 * stored with a plain byte store under the exclusive latch and must
+	 * not share the non-atomic read-modify-write of the flags word (which
+	 * __memp_pgwrite clears BH_DIRTY in while holding only a shared latch).
+	 */
+	u_int8_t	gen;
+
 	u_int32_t	priority;	/* Priority. */
 	SH_TAILQ_ENTRY	hq;		/* MPOOL hash bucket queue. */
 
@@ -595,7 +722,104 @@ struct __bh_frozen_a {
 	SH_TAILQ_ENTRY links;
 };
 
+/*
+ * DB_MPOOL_RETRY --
+ *	Internal-only return from __memp_fget_opt / the optimistic descent:
+ *	"this page could not be read optimistically (or the read did not
+ *	validate), use the ordinary pinning path".  Defined here rather than in
+ *	db.in because it must NEVER reach an application: every producer has
+ *	exactly one consumer, the bounded retry loop in __bam_search.  Value
+ *	taken from the private error range (db.in: DB_VERIFY_FATAL is -30887).
+ */
+#define	DB_MPOOL_RETRY		(-30886)
+
 #define	MULTIVERSION(dbp)	atomic_read(&(dbp)->mpf->mfp->multiversion)
+
+/*
+ * RFC 0007 phase 1 -- optimistic read validation.
+ *
+ * BH.gen is a one-byte seqlock over the frame:
+ *
+ *	bit 0		"in flux": the frame is held exclusively (being read
+ *			in, modified, frozen/thawed, or reused by eviction).
+ *	bits 1..7	episode counter, bumped once per exclusive acquisition.
+ *
+ * Writers: BH_GEN_EXCL_ENTER at every exclusive acquisition (bump + mark),
+ * BH_GEN_EXCL_EXIT at release (clear the mark).  Both are done while holding
+ * mtx_buf exclusively, so the read-modify-write needs no atomic -- it is the
+ * same argument that lets the existing code do F_SET(bhp, BH_EXCLUSIVE) there.
+ *
+ * The asymmetry is deliberate and is what makes this auditable: MISSING an
+ * ENTER would be a correctness bug, but missing an EXIT only leaves the frame
+ * looking permanently in flux, which makes optimistic readers fall back to the
+ * pinning path forever.  Fail-closed.  There are 8 acquisition sites (7
+ * F_SET(bhp, BH_EXCLUSIVE) plus the fresh-frame initialization in
+ * __memp_fget) and they are all routed through BH_GEN_EXCL_ENTER.
+ *
+ * gen is never assigned outside these macros -- in particular it is NOT reset
+ * when a frame is reused, because a reset could hand a reader the same value it
+ * sampled from the frame's previous life (see the ABA note in struct __bh).
+ *
+ * Memory ordering (see rfc/0007 and OPTIMISTIC-READS-2026-09.md):
+ *
+ *   writer: [store gen odd] FENCE [store page bytes] ... FENCE [store gen even]
+ *   reader: [load gen,pgno,mf] FENCE [load page bytes] FENCE [reload gen,pgno,mf]
+ *
+ * __os_atomic_thread_fence() is a sequentially-consistent fence on every
+ * backend (__atomic_thread_fence / __sync_synchronize / MemoryBarrier / x86
+ * lock-prefixed op / membar_enter), so the argument is not an x86-TSO argument:
+ * on ARM64, PPC and RISC-V the fence emits the dmb ish / sync / fence needed to
+ * order the plain loads and stores on either side of it.
+ */
+#define	BH_GEN_INFLUX		0x01	/* Frame is exclusively held. */
+#define	BH_GEN_STEP		0x02	/* One episode. */
+
+#define	BH_GEN_EXCL_ENTER(bhp) do {					\
+	(bhp)->gen = (u_int8_t)(((bhp)->gen + BH_GEN_STEP) | BH_GEN_INFLUX);\
+	__os_atomic_thread_fence();					\
+} while (0)
+
+#define	BH_GEN_EXCL_EXIT(bhp) do {					\
+	__os_atomic_thread_fence();					\
+	(bhp)->gen = (u_int8_t)((bhp)->gen & ~BH_GEN_INFLUX);		\
+} while (0)
+
+/*
+ * Set/clear BH_EXCLUSIVE together with the generation.  Every existing
+ * F_SET(bhp, BH_EXCLUSIVE) / F_CLR(bhp, BH_EXCLUSIVE) is spelled this way so
+ * the two can never drift apart.
+ */
+#define	BH_SET_EXCLUSIVE(bhp) do {					\
+	F_SET((bhp), BH_EXCLUSIVE);					\
+	BH_GEN_EXCL_ENTER(bhp);						\
+} while (0)
+
+#define	BH_CLR_EXCLUSIVE(bhp) do {					\
+	BH_GEN_EXCL_EXIT(bhp);						\
+	F_CLR((bhp), BH_EXCLUSIVE);					\
+} while (0)
+
+/*
+ * BH_SAMPLE --
+ *	What an optimistic reader observes about a frame before reading the
+ *	page, and re-checks afterwards.  gen alone is only 7 bits of counter,
+ *	so the page identity travels with it (see the ABA bound in struct
+ *	__bh).
+ */
+typedef struct __bh_sample {
+	BH		*bhp;		/* Frame observed. */
+	db_pgno_t	pgno;		/* ... hosting this page ... */
+	roff_t		mf_offset;	/* ... of this file ... */
+	u_int8_t	gen;		/* ... at this generation (always even). */
+} BH_SAMPLE;
+
+/* True if the frame still holds exactly what the sample recorded. */
+#define	BH_SAMPLE_VALID(s)						\
+	(__os_atomic_thread_fence(),					\
+	 (s)->bhp != NULL &&						\
+	 (s)->bhp->gen == (s)->gen &&					\
+	 (s)->bhp->pgno == (s)->pgno &&					\
+	 (s)->bhp->mf_offset == (s)->mf_offset)
 
 #define	PAGE_TO_BH(p)	(BH *)((u_int8_t *)(p) - SSZA(BH, buf))
 #define	IS_DIRTY(p)							\
@@ -695,6 +919,36 @@ struct __bh_frozen_a {
 #if defined(__cplusplus)
 }
 #endif
+
+/*
+ * MEMP_PGW --
+ *	Page-write state shared across the prep / I-O / finish phases so a
+ *	write can be issued synchronously or asynchronously from one copy of
+ *	the WAL-ordering, pgout, and bookkeeping logic.
+ * MEMP_AIO_W --
+ *	One asynchronous checkpoint write in flight: the prep state plus the
+ *	pinned buffer and held file-handle reference to release on completion.
+ */
+typedef struct __memp_pgw {
+	ENV		*env;
+	DB_MPOOLFILE	*dbmfp;
+	DB_MPOOL_HASH	*hp;
+	BH		*bhp;
+	MPOOLFILE	*mfp;
+	void		*buf;		/* page image to write (bhp->buf or copy) */
+	int		 writers_inced;	/* mfp->writers was incremented */
+} MEMP_PGW;
+
+typedef struct __memp_aio_w {
+	MEMP_PGW	 ctx;		/* prep state */
+	BH		*bhp;		/* pinned buffer (ref + shared mtx_buf) */
+	DB_MPOOLFILE	*dbmfp;		/* held file-handle reference */
+	int		 opened;	/* dbmfp opened here (close on finish) */
+	volatile int	 io_ret;	/* write result (set by completion) */
+	volatile int	 done;		/* completion observed */
+} MEMP_AIO_W;
+
+#define	MEMP_AIO_WINDOW	16		/* max checkpoint writes in flight */
 
 #include "dbinc_auto/mp_ext.h"
 #endif /* !_DB_MP_H_ */

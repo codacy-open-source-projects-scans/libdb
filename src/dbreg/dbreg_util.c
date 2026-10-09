@@ -433,7 +433,24 @@ __dbreg_id_to_db(env, txn, dbpp, ndx, tryopen)
 			return (ret);
 
 		*dbpp = dblp->dbentry[ndx].dbp;
-		return (*dbpp == NULL ? DB_DELETED : 0);
+		if (*dbpp == NULL)
+			return (DB_DELETED);
+		/*
+		 * __dbreg_do_open() registers the handle with __dbreg_assign_id()
+		 * before the open is finished, so a failure after that point (an
+		 * allocation failure, say) leaves a handle in the entry whose
+		 * __db_open() never completed: its mpf is set but names an mpool
+		 * file that was never validly attached.  Reporting success here
+		 * handed that half-built handle to the caller, and REC_INTRO's
+		 * __db_cursor()/MULTIVERSION() dereferenced it -- a SIGSEGV while
+		 * undoing a transaction at env close.  Treat it as not openable;
+		 * every REC_INTRO caller already propagates the error.
+		 */
+		if (!F_ISSET(*dbpp, DB_AM_OPEN_CALLED)) {
+			*dbpp = NULL;
+			return (ENOENT);
+		}
+		return (0);
 	}
 
 	/*
@@ -447,7 +464,11 @@ __dbreg_id_to_db(env, txn, dbpp, ndx, tryopen)
 	/* It's an error if we don't have a corresponding writable DB. */
 	if ((*dbpp = dblp->dbentry[ndx].dbp) == NULL)
 		ret = ENOENT;
-	else
+	else if (!F_ISSET(*dbpp, DB_AM_OPEN_CALLED)) {
+		/* See the comment on the tryopen path above. */
+		*dbpp = NULL;
+		ret = ENOENT;
+	} else
 		/*
 		 * If we are in recovery, then set that the file has
 		 * been written.  It is possible to run recovery,
@@ -554,12 +575,44 @@ __dbreg_get_name(env, fid, fnamep, dnamep)
 	u_int8_t *fid;
 	char **fnamep, **dnamep;
 {
+	return (__dbreg_get_name_locked(env, fid, fnamep, dnamep, 0));
+}
+
+/*
+ * __dbreg_get_name_locked --
+ *	__dbreg_get_name, but the caller may already hold mtx_filelist.
+ *
+ *	This exists for the lock-object dump (L1).  __lock_printlock resolved a
+ *	page lock's file id while holding an OBJECT_LOCK, which takes
+ *	mtx_filelist (rank 20, DB_LO_RANK_HANDLE) UNDER the lock partition
+ *	(rank 30, DB_LO_RANK_LOCK_PART) -- the reverse of the declared order,
+ *	which the A3 rank checker reports as BDB2084 and then panics the
+ *	environment.  The declared direction is the one the engine already uses
+ *	elsewhere: dbreg.c:283 -> log_put.c:174 takes mtx_filelist and THEN the
+ *	system lock.  So the dump is what was inverted, not the ranking.
+ *
+ *	The fix is for the dump to take mtx_filelist first, outside the object
+ *	walk, and tell this function not to take it again -- which also makes the
+ *	whole dump see one consistent view of the file-name list instead of
+ *	re-locking per lock.
+ *
+ * PUBLIC: int __dbreg_get_name_locked
+ * PUBLIC:     __P((ENV *, u_int8_t *, char **, char **, int));
+ */
+int
+__dbreg_get_name_locked(env, fid, fnamep, dnamep, have_lock)
+	ENV *env;
+	u_int8_t *fid;
+	char **fnamep, **dnamep;
+	int have_lock;
+{
 	DB_LOG *dblp;
 	FNAME *fnp;
 
 	dblp = env->lg_handle;
 
-	if (dblp != NULL && __dbreg_fid_to_fname(dblp, fid, 0, &fnp) == 0) {
+	if (dblp != NULL &&
+	    __dbreg_fid_to_fname(dblp, fid, have_lock, &fnp) == 0) {
 		*fnamep = fnp->fname_off == INVALID_ROFF ?
 		    NULL : R_ADDR(&dblp->reginfo, fnp->fname_off);
 		*dnamep = fnp->dname_off == INVALID_ROFF ?

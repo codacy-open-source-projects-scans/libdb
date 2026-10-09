@@ -550,10 +550,36 @@ __env_close_pp(dbenv, flags)
 		if (IS_ENV_REPLICATED(env))
 			(void)__repmgr_close(env);
 
-		/* Close all underlying file handles. */
-		(void)__file_handle_cleanup(env);
-
-		PANIC_CHECK(env);
+		/*
+		 * For a shared (multi-process) environment we stop here: the
+		 * panicked region may be corrupt and belongs to other processes,
+		 * so we must not tear it down.  But a DB_PRIVATE environment is
+		 * just this process's heap -- there is no other process to hand
+		 * it to, and returning here leaks every malloc'd region (mpool,
+		 * log, ...) and all their buffers.  So for a private env we fall
+		 * through to __env_close/__env_refresh to free the heap, exactly
+		 * as __env_open's own post-panic error path does.
+		 *
+		 * For the shared case, force-close any leaked file handles now and
+		 * bail via PANIC_CHECK.  For the private case we must NOT do that
+		 * force-close here: the orderly teardown below closes files
+		 * through the mpoolfile path (__memp_fclose), which still
+		 * dereferences env->fdlist handles -- freeing them first would be
+		 * a use-after-free.
+		 *
+		 * To reach the teardown we suppress the panic for the duration of
+		 * the close: both this explicit check and the PANIC_CHECK inside
+		 * ENV_ENTER below would otherwise bail out.  We also suppress the
+		 * cache flush (__env_refresh's __memp_sync_int) -- the pages may
+		 * be corrupt and there is nothing durable to preserve for a
+		 * private, panicked env; we only want to reclaim memory.
+		 */
+		if (!F_ISSET(env, ENV_PRIVATE)) {
+			/* Close all underlying file handles. */
+			(void)__file_handle_cleanup(env);
+			PANIC_CHECK(env);
+		}
+		F_SET(dbenv, DB_ENV_NOPANIC | DB_ENV_NOIO);
 	}
 
 	ENV_ENTER(env, ip);
@@ -578,6 +604,12 @@ __env_close_pp(dbenv, flags)
 		close_flags |= DBENV_CLOSE_REPCHECK;
 	if ((t_ret = __env_close(dbenv, close_flags)) != 0 && ret == 0)
 		ret = t_ret;
+
+	/*
+	 * Note: we do NOT restore the NOPANIC/NOFLUSH bits we may have set
+	 * above -- __env_close is the DB_ENV handle destructor and has freed
+	 * dbenv by now, so touching its flags here is a use-after-free.
+	 */
 
 	/* Don't ENV_LEAVE as we have already detached from the region. */
 	return (ret);
@@ -1145,10 +1177,19 @@ __env_attach_regions(dbenv, flags, orig_flags, retry_ok)
 		 * Initialize the DB list and its mutex.  If the mpool is
 		 * not initialized, we can't ever open a DB handle, which
 		 * is why this code lives here.
+		 *
+		 * The list latch is SHARED (a reader/writer latch).  Mutating
+		 * the list -- __env_setup inserting a handle, __db_refresh
+		 * removing one -- still takes it exclusively via MUTEX_LOCK.
+		 * The one hot path that only READS the list, __db_walk_cursors
+		 * (reached from __bam_ca_di on every B-tree insert), takes it
+		 * shared, so concurrent inserts no longer serialize on it.  The
+		 * cursor queues it walks have their own per-partition mutexes.
 		 */
 		TAILQ_INIT(&env->dblist);
 		if ((ret = __mutex_alloc(env, MTX_ENV_DBLIST,
-		    DB_MUTEX_PROCESS_ONLY, &env->mtx_dblist)) != 0)
+		    DB_MUTEX_PROCESS_ONLY | DB_MUTEX_SHARED,
+		    &env->mtx_dblist)) != 0)
 			goto err;
 
 		/* Register DB's pgin/pgout functions.  */
