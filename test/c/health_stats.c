@@ -173,7 +173,7 @@ main(int argc, char *argv[])
 {
 	DB_TXN *txn, *reader;
 	DBT key, data;
-	struct sample s, base, peak, early, late;
+	struct sample s, base, peak, early, mid, late;
 	const char *mode;
 	u_int32_t txn_flags, dbflags;
 	char keybuf[64], databuf[VALUE_BYTES];
@@ -254,6 +254,7 @@ main(int argc, char *argv[])
 
 	take(&base);
 	peak = early = base;
+	memset(&mid, 0, sizeof(mid));
 	memset(&late, 0, sizeof(late));
 	sawtooth_down = 0;
 
@@ -398,7 +399,10 @@ main(int argc, char *argv[])
 				early.nsnapshot = s.nsnapshot;
 			if (s.mutex_inuse > early.mutex_inuse)
 				early.mutex_inuse = s.mutex_inuse;
-		} else if (completed > (TXNS * 2) / 3) {
+		} else if (completed <= (TXNS * 2) / 3) {
+			if (s.mutex_inuse > mid.mutex_inuse)
+				mid.mutex_inuse = s.mutex_inuse;
+		} else {
 			if (s.nlockers > late.nlockers)
 				late.nlockers = s.nlockers;
 			if (s.nsnapshot > late.nsnapshot)
@@ -558,11 +562,46 @@ main(int argc, char *argv[])
 		    (u_long)early.nsnapshot, (u_long)late.nsnapshot);
 		ret = 1;
 	}
-	if (early.mutex_inuse != 0 && late.mutex_inuse > early.mutex_inuse) {
-		fprintf(stderr, "FAIL: peak mutex slots rose from %lu (early) "
-		    "to %lu (late)\n",
-		    (u_long)early.mutex_inuse, (u_long)late.mutex_inuse);
-		ret = 1;
+	/*
+	 * Mutex slots: the population must be CONVERGING, i.e. it rises by less in
+	 * the last third than it did in the first two. A strict early-vs-late test
+	 * cannot tell P12's one-time warmup from a leak.
+	 *
+	 * Since P12 + P13 (v2026.10.5) each of the 64 locker stripes keeps its own
+	 * free list and a recycled locker keeps its mutex. So the sawtooth's first
+	 * reclaims send lockers back to THEIR stripes, and the next creates, which
+	 * hash to other stripes, each allocate a mutex there once. Measured:
+	 *   CI, si137:      287 for 2500 txns, one step to 306, then flat to 6000
+	 *   FreeBSD, si138: early->late +2/+3/+2/+0 at 6k/24k/60k/240k txns
+	 *                   (thirds at 6k: 1230 / 1230 / 1232)
+	 * With DB_NO_LOCKER_SHARD=1 or DB_NO_LOCKER_MUTEX_REUSE=1 it is exactly
+	 * flat. A real leak rises at a CONSTANT rate per transaction, so its last
+	 * third climbs as much as its middle third:
+	 *   injected 1 mutex/50 txns, si137: 470 / 490 / 510   (+20, +20)
+	 *   injected 1 mutex/50 txns, si138: 1249 / 1269 / 1291 (+20, +22)
+	 * The rule: late - mid must be less than half of mid - early, with a floor
+	 * of 2 slots of noise. A warmup's later step is a fraction of its earlier
+	 * one; a constant-rate leak's is not. No constant is tuned to a run length.
+	 *
+	 * Three earlier versions were wrong, each found by measurement:
+	 * a 64-slot allowance PASSED the injected leak (+42 over the run, and
+	 * mutex_max=0 here, so (2c) is blind too); an 8-slot allowance failed CI's
+	 * legitimate +19 step; strict late > mid failed FreeBSD's legitimate +2.
+	 */
+	{
+		long d_early, d_late;
+
+		d_early = (long)mid.mutex_inuse - (long)early.mutex_inuse;
+		d_late = (long)late.mutex_inuse - (long)mid.mutex_inuse;
+		if (mid.mutex_inuse != 0 &&
+		    d_late > 2 && 2 * d_late >= d_early) {
+			fprintf(stderr, "FAIL: peak mutex slots not converging: "
+			    "%lu / %lu / %lu by thirds (+%ld then +%ld) -- a "
+			    "constant-rate rise is a leak\n",
+			    (u_long)early.mutex_inuse, (u_long)mid.mutex_inuse,
+			    (u_long)late.mutex_inuse, d_early, d_late);
+			ret = 1;
+		}
 	}
 
 	/*

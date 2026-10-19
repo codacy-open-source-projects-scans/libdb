@@ -248,10 +248,36 @@ struct __db_txnregion { /* SHARED */
 	u_int32_t n_hotbackup;		/* Num. of outstanding backup notices.*/
 
 #define	TXN_IN_RECOVERY	 0x01		/* environment is being recovered */
+#define	TXN_REGION_FREELIST 0x02	/* S5: recycle TXN_DETAILs via free_txn
+					 * instead of __env_alloc/_free on every
+					 * begin/end.  Latched by DB_TXN_FREELIST
+					 * at region create, recorded here so all
+					 * attaching processes agree. */
+#define	TXN_REGION_LATCHSPLIT 0x04	/* M1: mtx_region is a dedicated txn
+					 * latch, NOT aliased to mtx_regenv.
+					 * Latched by DB_TXN_LATCH_SPLIT at
+					 * region create (see txn_region.c). */
 	u_int32_t	flags;
+	/*
+	 * RFC 0015 S4: a bounded LIFO cache of initialised MTX_TXN_MVCC
+	 * mutexes retained from committed MVCC-writer details, so the next
+	 * writer reuses one instead of taking MUTEX_SYSTEM_LOCK for an
+	 * alloc + a free per writer txn (the P13 shape for the MVCC mutex).
+	 * free_mvcc_mtx points at an array of region->maxtxns db_mutex_t;
+	 * free_mvcc_n is how many are currently stashed.  A pure cache: a
+	 * full stack frees normally, an empty stack allocates normally, so
+	 * it never fails and never bounds concurrency.  It is NOT the S5
+	 * TXN_DETAIL free list (that is a separate change on another branch);
+	 * these fields are additive and independent.
+	 */
+	roff_t		free_mvcc_mtx;	/* Array of retained MTX_TXN_MVCC. */
+	u_int32_t	free_mvcc_n;	/* Count currently stashed. */
+	u_int32_t	free_mvcc_max;	/* Capacity of the array. */
 					/* active TXN list */
 	SH_TAILQ_HEAD(__active) active_txn;
 	SH_TAILQ_HEAD(__mvcc) mvcc_txn;
+					/* S5: free list of recycled details. */
+	SH_TAILQ_HEAD(__tdfree) free_txn;
 };
 
 /*

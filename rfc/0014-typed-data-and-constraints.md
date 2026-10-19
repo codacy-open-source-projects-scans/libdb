@@ -1,6 +1,6 @@
 # RFC 0014: Typed data and constraints — a codec socket and a constraint layer
 
-- **Status:** Draft
+- **Status:** Accepted for implementation (Phases 0–1); see "Maintainer decisions taken"
 - **Type:** Prospective
 - **Author:** libdb maintainers (draft prepared for review)
 - **Date:** 2026-10-10
@@ -920,7 +920,9 @@ risks reduce to cursor-adjustment helpers in `src/btree/bt_curadj.c`
 each of those bodies has **zero** comparator calls: they move cursors by
 page number and index, never by key. Recovery is physical page redo/undo
 keyed by LSN and (pgno, indx). **So `db_recover` can stay usable with no
-application codecs**, and the JE fallback below is not needed. (Caveat: this
+application codecs**, provided it is built with `--enable-typed` (see D5 / C14: an old
+library fails closed on the typed meta bit before recovery reaches any comparator), and
+the JE fallback below is not needed. (Caveat: this
 is a grep over today's tree; a future recovery path that searches by key
 would reopen the question, which is why Phase 1's test list includes "run
 standalone `db_recover` against a typed environment with no codecs
@@ -1300,6 +1302,43 @@ needs measuring (the parent-leaf copy, §Concurrency).
   hot backup and replication (the catalog replicates because it is
   ordinary data; the clients must register the same codecs, which is noxu's
   stated bound, `design-decisions.md:412-432`).
+
+---
+
+## Maintainer decisions taken for implementation (2026-10-10)
+
+The maintainer directed that this RFC be finished and implemented. The eight
+open decisions were resolved with these defaults. Each can still be overruled;
+the reasoning is given so that an override can be targeted.
+
+- **D1 — build it: YES.** Phases 0 and 1 are in scope for the release that
+  follows v2026.10.5. Phase 2 is designed here but implemented only if Phase
+  1 lands clean with time to spare. Phase 3 stays deferred.
+- **D2 — side table, not a `struct __db` pointer.** `test/db/run_handle_sizes.sh`
+  pins `sizeof(DB)=1744` as public ABI, and the north star is "a build without
+  the subsystem is byte-identical". A side table keyed on the `DB *` keeps
+  every handle size and the region signature unchanged *even in enabled
+  builds*. Its cost is one lookup on put, and only for databases with a
+  schema; an untyped database pays a single predictable branch. If that
+  lookup measures above noise on the put path, revisit.
+- **D3 — catalog subdatabase inside the same file.** It travels with the
+  database through `db_dump`/`db_load`, backup, `DB->rename` and hot copy,
+  and it needs no new per-environment file whose lifecycle has to be kept in
+  step.
+- **D4 — Btree and Hash only in Phase 1.** Heap and Queue are left out until
+  a consumer asks, so no access-method format version is bumped.
+- **D5 — `db_recover` works with no codecs, *if* it was built with `--enable-typed`; tested.** (Corrected by the implementation spec, C14.) No recovery path calls a comparator, which was verified in review (§Recovery). But recovery still **opens** each database through `__dbreg_open_file`, and a typed file carries a meta-page bit (`BTM_TYPED` / `DB_HASH_TYPED`) that an old or default-build library rejects with `EINVAL` (`bt_open.c:156-158`, `hash_open.c:194-197`). `dbreg_rec.c:144-167` forgives only `ENOENT`, so an **old `db_recover` fails on a typed environment**. That fails closed and is the right behaviour; nothing is half-recovered. The guarantee, then: a `db_recover` from an `--enable-typed` build recovers a typed environment **without application codecs registered**, and `typed_recover` enforces it. "Any `db_recover`" is not guaranteed and is not claimed.
+- **D6 — the Phase 0 uniqueness error becomes `DB_KEYEXIST`, but only on a
+  typed database.** Untyped secondaries keep returning `EINVAL`, so no
+  existing caller sees a behaviour change. Typed databases are new, and they
+  get the right error from the start.
+- **D7 — refuse.** Under `DB_OPTREAD`, a codec without `DB_CODEC_TOTAL` makes
+  `DB->open` fail with `EINVAL` and a message that names the codec. The
+  RFC 0007 copy-then-validate path is a separate project.
+- **D8 — no `dlopen` plugin.** The utilities (`db_dump`, `db_verify`,
+  `db_load`) handle typed databases as untyped bytes and say so in their
+  output. A plugin means loading foreign code into tools that run as an
+  operator, and nobody has asked for it.
 
 ---
 

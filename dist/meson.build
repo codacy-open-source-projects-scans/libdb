@@ -119,6 +119,15 @@ int main(void) {
   endif
 endif
 
+# Mirrors dist/aclocal/mutex.m4's db_cv_aarch64 probe, which defines
+# HAVE_ATOMIC_AARCH64 on any AArch64 target independent of the atomic tier.
+# No source file consumes it today, so it changes no struct; it is here so the
+# two builds' HAVE_* sets match, which run_meson_autoconf_parity.sh checks
+# (it failed on FreeBSD/arm64 c7gd.metal without this).
+if host_machine.cpu_family() == 'aarch64'
+  cdata.set('HAVE_ATOMIC_AARCH64', 1)
+endif
+
 # io_uring: header AND the library symbol, as AC_CHECK_LIB(uring, ...) does.
 # os_aio_uring.c is in the source list unconditionally and is whole-file guarded
 # on HAVE_IO_URING, so without this it compiled to nothing and the io_uring
@@ -200,6 +209,25 @@ int main(void) {
 }''', args: probe_args, name: 'x86_64 gcc-assembly TAS mutex')
   cdata.set('HAVE_MUTEX_X86_64_GCC_ASSEMBLY', 1)
   # pthreads is unconditional above, so pthread + tas == hybrid.
+  cdata.set('HAVE_MUTEX_HYBRID', 1)
+endif
+
+# AArch64 test-and-set: dist/aclocal/mutex.m4's hybrid ARM64/gcc-assembly
+# probe, which is compile-only (an architecture test).  The implementation is
+# the compiler's __atomic builtins (src/dbinc/mutex_int.h), so the link test
+# here is the one thing that could actually be missing: outline atomics need
+# __aarch64_swp1_acq from the compiler runtime.
+#
+# Darwin/arm64 selects it too, mirroring mutex.m4 (the one-release exclusion
+# in 681026b49 rested on a test-runner bug, F7).
+if host_machine.cpu_family() == 'aarch64' and cc.links('''
+int main(void) {
+	volatile unsigned char tsl = 0;
+	int r = __atomic_exchange_n(&tsl, 1, __ATOMIC_ACQUIRE);
+	__atomic_store_n(&tsl, 0, __ATOMIC_RELEASE);
+	return (r);
+}''', args: probe_args, name: 'ARM64 gcc-assembly TAS mutex')
+  cdata.set('HAVE_MUTEX_ARM64_GCC_ASSEMBLY', 1)
   cdata.set('HAVE_MUTEX_HYBRID', 1)
 endif
 
@@ -303,8 +331,8 @@ cdata.set('SIZEOF_CHAR_P', cc.sizeof('void *'))
 # Package strings.
 cdata.set_quoted('PACKAGE_NAME', 'Berkeley DB')
 cdata.set_quoted('PACKAGE_TARNAME', 'db')
-cdata.set_quoted('PACKAGE_VERSION', '2026.10.4')
-cdata.set_quoted('PACKAGE_STRING', 'libdb 2026.10.4')
+cdata.set_quoted('PACKAGE_VERSION', '2026.10.7')
+cdata.set_quoted('PACKAGE_STRING', 'libdb 2026.10.7')
 cdata.set_quoted('PACKAGE_BUGREPORT', '')
 cdata.set_quoted('PACKAGE_URL', '')
 cdata.set_quoted('LT_OBJDIR', '.libs/')
@@ -622,7 +650,8 @@ libdb_srcnames = [
 # dist/aclocal/mutex.m4).  Adding it unconditionally builds it on platforms where
 # struct __db_mutex_t has no `tas' or `sharecount' member, which is exactly how
 # macOS failed: "no member named 'sharecount' in 'struct __db_mutex_t'".
-if cdata.has('HAVE_MUTEX_X86_64_GCC_ASSEMBLY')
+if cdata.has('HAVE_MUTEX_X86_64_GCC_ASSEMBLY') or \
+    cdata.has('HAVE_MUTEX_ARM64_GCC_ASSEMBLY')
   libdb_srcnames += 'src/mutex/mut_tas.c'
 endif
 

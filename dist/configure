@@ -3596,11 +3596,11 @@ DB_VERSION_MINOR="0"
 
 DB_VERSION_PATCH="9"
 
-DB_CALVER="2026.10.4"
+DB_CALVER="2026.10.7"
 
-DB_VERSION_STRING='"libdb 2026.10.4 (October 10, 2026)"'
+DB_VERSION_STRING='"libdb 2026.10.7 (October 15, 2026)"'
 
-DB_VERSION_FULL_STRING='"libdb 2026.10.4 (October 10, 2026)"'
+DB_VERSION_FULL_STRING='"libdb 2026.10.7 (October 15, 2026)"'
 
 
 # Process all options before using them.
@@ -14715,7 +14715,7 @@ fi
     # support.  Future versions do this automatically, but an explicit c++rt0.o
     # does not break anything, and helps significantly (at the cost of a little
     # extra space).
-    freebsd2.2*)
+    freebsd2.2.*)
       archive_cmds='$LD -Bshareable -o $lib $libobjs $deplibs $linker_flags /usr/lib/c++rt0.o'
       hardcode_libdir_flag_spec='-R$libdir'
       hardcode_direct=yes
@@ -14723,7 +14723,7 @@ fi
       ;;
 
     # Unfortunately, older versions of FreeBSD 2 do not have this feature.
-    freebsd2*)
+    freebsd2.*)
       archive_cmds='$LD -Bshareable -o $lib $libobjs $deplibs $linker_flags'
       hardcode_direct=yes
       hardcode_minus_L=yes
@@ -15725,7 +15725,10 @@ freebsd* | dragonfly*)
     objformat=`/usr/bin/objformat`
   else
     case $host_os in
-    freebsd[123]*) objformat=aout ;;
+    # Anchored (G18): freebsd[123]* also matched freebsd10..39. With no
+    # /usr/bin/objformat (gone since FreeBSD 13) every modern FreeBSD got the
+    # 1993 a.out naming: no libX.so link, so dlopen of the .so name failed.
+    freebsd[123].*) objformat=aout ;;
     *) objformat=elf ;;
     esac
   fi
@@ -15743,7 +15746,7 @@ freebsd* | dragonfly*)
   esac
   shlibpath_var=LD_LIBRARY_PATH
   case $host_os in
-  freebsd2*)
+  freebsd2.*)
     shlibpath_overrides_runpath=yes
     ;;
   freebsd3.[01]* | freebsdelf3.[01]*)
@@ -17752,7 +17755,7 @@ fi
         esac
         ;;
 
-      freebsd[12]*)
+      freebsd[12].*)
         # C++ shared libraries reported to be fairly broken before
 	# switch to ELF
         ld_shlibs_CXX=no
@@ -19644,7 +19647,10 @@ freebsd* | dragonfly*)
     objformat=`/usr/bin/objformat`
   else
     case $host_os in
-    freebsd[123]*) objformat=aout ;;
+    # Anchored (G18): freebsd[123]* also matched freebsd10..39. With no
+    # /usr/bin/objformat (gone since FreeBSD 13) every modern FreeBSD got the
+    # 1993 a.out naming: no libX.so link, so dlopen of the .so name failed.
+    freebsd[123].*) objformat=aout ;;
     *) objformat=elf ;;
     esac
   fi
@@ -19662,7 +19668,7 @@ freebsd* | dragonfly*)
   esac
   shlibpath_var=LD_LIBRARY_PATH
   case $host_os in
-  freebsd2*)
+  freebsd2.*)
     shlibpath_overrides_runpath=yes
     ;;
   freebsd3.[01]* | freebsdelf3.[01]*)
@@ -20481,7 +20487,7 @@ else case e in #(
 JAVA_TEST=Test.java
 CLASS_TEST=Test.class
 cat << \EOF > $JAVA_TEST
-/* #line 20484 "configure" */
+/* #line 20490 "configure" */
 public class Test {
 }
 EOF
@@ -20776,7 +20782,7 @@ EOF
 if uudecode$EXEEXT Test.uue; then
         ac_cv_prog_uudecode_base64=yes
 else
-        echo "configure: 20779: uudecode had trouble decoding base 64 file 'Test.uue'" >&5
+        echo "configure: 20785: uudecode had trouble decoding base 64 file 'Test.uue'" >&5
         echo "configure: failed file was:" >&5
         cat Test.uue >&5
         ac_cv_prog_uudecode_base64=no
@@ -20908,7 +20914,7 @@ else case e in #(
 JAVA_TEST=Test.java
 CLASS_TEST=Test.class
 cat << \EOF > $JAVA_TEST
-/* #line 20911 "configure" */
+/* #line 20917 "configure" */
 public class Test {
 }
 EOF
@@ -20945,7 +20951,7 @@ JAVA_TEST=Test.java
 CLASS_TEST=Test.class
 TEST=Test
 cat << \EOF > $JAVA_TEST
-/* [#]line 20948 "configure" */
+/* [#]line 20954 "configure" */
 public class Test {
 public static void main (String args[]) {
         System.exit (0);
@@ -24838,6 +24844,41 @@ then :
 fi
 rm -f core conftest.err conftest.$ac_objext conftest.beam conftest.$ac_ext
 
+# ARM64/AArch64 gcc/clang: FreeBSD, Linux, macOS.  A HYBRID probe, so it must
+# sit here with the x86 ones, not in the TAS-only list below, which runs only
+# when no pthreads mutex was found -- i.e. never on these platforms.  It used
+# to be there, and that is why aarch64 built as plain POSIX/pthreads/library:
+# every acquire a pthread call, and on FreeBSD every multi-process attach
+# exposed to B3 at t=1 (test/KNOWN-ISSUES.md).
+#
+# Darwin/arm64 was excluded for one release (681026b49) on a misdiagnosis:
+# run_mutex_stress printed no verdict there, but the runner -- not the mutex --
+# was broken (F7: dyld install-name over -rpath, and no GNU timeout).  With the
+# runner fixed the hybrid passes on Apple Silicon with its teeth intact, so
+# macOS selects it again.
+cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+/* end confdefs.h.  */
+
+int
+main (void)
+{
+
+#if (defined(__aarch64__) || defined(_M_ARM64)) && defined(__GNUC__)
+	(void)0;  /* compile-only probe; nothing is run */
+#else
+	FAIL TO COMPILE/LINK
+#endif
+
+  ;
+  return 0;
+}
+_ACEOF
+if ac_fn_c_try_compile "$LINENO"
+then :
+  db_cv_mutex="$db_cv_mutex/ARM64/gcc-assembly"
+fi
+rm -f core conftest.err conftest.$ac_objext conftest.beam conftest.$ac_ext
+
 # Solaris is one of the systems where we can configure hybrid mutexes.
 # However, we require the membar_enter function for that, and only newer
 # Solaris releases have it.  Check to see if we can configure hybrids.
@@ -25448,32 +25489,6 @@ fi
 rm -f core conftest.err conftest.$ac_objext conftest.beam conftest.$ac_ext
 fi
 
-# ARM64/AArch64/gcc: Modern ARM 64-bit (Apple Silicon, Linux ARM64, etc.)
-if test "$db_cv_mutex" = no; then
-cat confdefs.h - <<_ACEOF >conftest.$ac_ext
-/* end confdefs.h.  */
-
-int
-main (void)
-{
-
-#if (defined(__aarch64__) || defined(_M_ARM64)) && defined(__GNUC__)
-	(void)0;  /* compile-only probe; nothing is run */
-#else
-	FAIL TO COMPILE/LINK
-#endif
-
-  ;
-  return 0;
-}
-_ACEOF
-if ac_fn_c_try_compile "$LINENO"
-then :
-  db_cv_mutex=ARM64/gcc-assembly
-fi
-rm -f core conftest.err conftest.$ac_objext conftest.beam conftest.$ac_ext
-fi
-
 # ARM32/gcc: ARM 32-bit systems
 if test "$db_cv_mutex" = no; then
 cat confdefs.h - <<_ACEOF >conftest.$ac_ext
@@ -25631,7 +25646,8 @@ ALPHA/gcc-assembly)	ADDITIONAL_OBJS="mut_tas${o} $ADDITIONAL_OBJS"
 			printf '%s\n' "#define HAVE_MUTEX_ALPHA_GCC_ASSEMBLY 1" >>confdefs.h
 
 			;;
-ARM64/gcc-assembly)	ADDITIONAL_OBJS="mut_tas${o} $ADDITIONAL_OBJS"
+*ARM64/gcc-assembly)	hybrid="$hybrid/tas"
+			ADDITIONAL_OBJS="mut_tas${o} $ADDITIONAL_OBJS"
 			printf '%s\n' "#define HAVE_MUTEX_ARM64_GCC_ASSEMBLY 1" >>confdefs.h
 
 			;;

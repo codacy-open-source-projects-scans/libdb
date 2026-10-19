@@ -466,6 +466,10 @@ db	run_recd_compact
 db	run_recd_handlers
 db	run_upgrade
 db	run_lock_priority_nullderef
+db	run_txn_remevent_leak
+db	run_compact_subdb_remove
+db	run_log_emfile_nopanic
+db	run_recover_foreign_file
 db	run_null_method_slots
 db	run_qam_extent_vrfy
 db	run_qam_inorder_consume
@@ -473,6 +477,7 @@ db	run_u9_serializable
 db	run_u8_backup_config
 db	run_handle_sizes
 db	run_s5_failchk_spin
+db	run_mutex_stress
 db	run_opt_null_sample
 db	run_configure_hostglob
 db	run_mvcc_mtx_doublefree
@@ -481,6 +486,10 @@ db	run_windows_srclist
 db	run_db_verify_multifile
 db	run_qam_readpath_bound
 db	run_curadj_dup_partition
+db	run_s7_stat_truth
+db	run_s3_mpool_counters
+db	run_s4_mvcc_mtx_reuse
+db	run_m5_fname_cache
 
 # ---------------------------------------------------------------------------
 # TCL suite.  The targeted per-push subset only (the full run_std suite is

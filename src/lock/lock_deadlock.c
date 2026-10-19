@@ -189,20 +189,29 @@ __lock_detect(env, atype, rejectp)
 		return (ret);
 
 	/*
-	 * We need the cur_maxid from the txn region as well.  In order
-	 * to avoid tricky synchronization between the lock and txn
-	 * regions, we simply unlock the lock region and then lock the
-	 * txn region.  This introduces a small window during which the
-	 * transaction system could then wrap.  We're willing to return
-	 * the wrong answer for "oldest" or "youngest" in those rare
-	 * circumstances.
+	 * We need the cur_maxid from the txn region as well.  This used to
+	 * take TXN_SYSTEM_LOCK just to read it.  That latch is
+	 * renv->mtx_regenv -- the log/txn latch -- and the detector runs on
+	 * EVERY blocking lock request, so the read cost 0.6-0.8 acquisitions
+	 * and 3-7% of all that latch's waits per TPROC-C commit at t >= 8
+	 * (RFC 0015 E1, measured with DB_REGENV_PROF).
+	 *
+	 * A latch buys nothing here.  cur_maxid is an aligned u_int32_t,
+	 * written only under TXN_SYSTEM_LOCK (txn.c __txn_recycle_id,
+	 * txn_region.c __txn_id_set), so a relaxed atomic load cannot tear;
+	 * and the value is only a tie-breaker for "oldest"/"youngest" victim
+	 * selection (__dd_isolder), which the original code already accepted
+	 * could be stale ("we simply unlock the lock region and then lock the
+	 * txn region ... We're willing to return the wrong answer for
+	 * 'oldest' or 'youngest' in those rare circumstances").  The window
+	 * is the same; only the latch is gone.  A volatile load rather than
+	 * __atomic_load_n because this file is also built by MSVC
+	 * (build_windows); it is the same single aligned 32-bit load.
 	 */
-	if (TXN_ON(env)) {
-		TXN_SYSTEM_LOCK(env);
-		txn_max = ((DB_TXNREGION *)
+	if (TXN_ON(env))
+		txn_max = *(volatile u_int32_t *)&((DB_TXNREGION *)
 		    env->tx_handle->reginfo.primary)->cur_maxid;
-		TXN_SYSTEM_UNLOCK(env);
-	} else
+	else
 		txn_max = TXN_MAXIMUM;
 
 	killid = BAD_KILLID;
@@ -395,7 +404,7 @@ __dd_build(env, atype, bmp, nlockers, allocp, idmap, rejectp, pri_set)
 	locker_info *id_array;
 	db_timespec now, min_timeout;
 	u_int32_t *bitmap, count, dd;
-	u_int32_t *entryp, gen, id, indx, ndx, nentries, *tmpmap;
+	u_int32_t *entryp, gen, id, indx, ndx, nentries, stripe, *tmpmap;
 	u_int8_t *pptr;
 	int is_first, ret;
 
@@ -462,7 +471,14 @@ skip:		LOCK_DD(env, region);
 	 * to make sure the structures are large enough.
 	 */
 	LOCK_LOCKERS(env, region);
-	count = region->nlockers;
+	/*
+	 * The in-use locker count is the sum of the per-stripe counts (P12).
+	 * It is exact here and STAYS exact for the walk below, because
+	 * LOCK_LOCKERS holds every stripe across both -- which matters: `count'
+	 * sizes the bitmap and id_array that the walk then indexes, and the
+	 * DB_ASSERT(id < count) in that walk is what would catch a skew.
+	 */
+	count = __lock_nlockers(region);
 	if (count == 0) {
 		UNLOCK_LOCKERS(env, region);
 		LOCK_SYSTEM_UNLOCK(lt, region);
@@ -506,8 +522,15 @@ skip:		LOCK_DD(env, region);
 	 */
 	id = 0;
 	*pri_set = 0;
-	SH_TAILQ_FOREACH(lip, &region->lockers, ulinks, __db_locker) {
-		if (lip->master_locker == INVALID_ROFF) {
+	/* Per-stripe in-use lists (P12): walk every one.  All are held. */
+	for (stripe = 0; stripe < LOCK_LOCKER_STRIPES; stripe++) {
+		SH_TAILQ_FOREACH(lip,
+		    &region->locker_stripe[stripe].lockers,
+		    ulinks, __db_locker) {
+			if (lip->master_locker != INVALID_ROFF) {
+				lip->dd_id = DD_INVALID_ID;
+				continue;
+			}
 			DB_ASSERT(env, id < count);
 			lip->dd_id = id++;
 			id_array[lip->dd_id].id = lip->id;
@@ -528,9 +551,7 @@ skip:		LOCK_DD(env, region);
 			default:
 				break;
 			}
-		} else
-			lip->dd_id = DD_INVALID_ID;
-
+		}
 	}
 
 	/*

@@ -49,7 +49,13 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#ifdef _WIN32
+#include <direct.h>		/* _mkdir */
+#include <windows.h>		/* for the rmtree below */
+#define	mkdir(d, m)	_mkdir(d)
+#else
 #include <unistd.h>
+#endif
 
 #include "db.h"
 
@@ -129,7 +135,15 @@ static long	 soak_n = 2000;
 static long	 soak_enomem_at = -1;	/* First txn that saw ENOMEM. */
 static const char *soak_enomem_call;
 
-static void soak_die(const char *, int) __attribute__((noreturn));
+#ifdef _WIN32
+#define	SOAK_NORETURN	__declspec(noreturn)
+#define	SOAK_NORETURN_POST
+#else
+#define	SOAK_NORETURN
+#define	SOAK_NORETURN_POST	__attribute__((noreturn))
+#endif
+
+static SOAK_NORETURN void soak_die(const char *, int) SOAK_NORETURN_POST;
 
 static void
 soak_die(const char *what, int rc)
@@ -173,8 +187,14 @@ soak_rmtree(const char *dir)
 {
 	char cmd[600];
 
+#ifdef _WIN32
+	/* rd /s /q removes the whole tree; soak_env_open recreates it after. */
+	(void)snprintf(cmd, sizeof(cmd),
+	    "rd /s /q \"%s\" 2>nul", dir);
+#else
 	(void)snprintf(cmd, sizeof(cmd),
 	    "find '%s' -mindepth 1 -delete 2>/dev/null", dir);
+#endif
 	(void)system(cmd);
 }
 
@@ -192,8 +212,8 @@ soak_env_open(const char *workload)
 	int rc;
 
 	(void)snprintf(soak_home, sizeof(soak_home), "SOAKDIR.%s", workload);
-	(void)mkdir(soak_home, 0755);
 	soak_rmtree(soak_home);
+	(void)mkdir(soak_home, 0755);
 
 	if ((rc = db_env_create(&env, 0)) != 0)
 		soak_die("db_env_create", rc);
@@ -749,7 +769,16 @@ main(int argc, char **argv)
 {
 	int failures, i, j, ran;
 
+#ifdef _WIN32
+	/*
+	 * MSVC's CRT rejects setvbuf(_IOLBF, NULL, 0) (it needs a real buffer
+	 * size for line buffering) and fail-fasts.  Unbuffered stdout gives the
+	 * same "every line visible immediately in the soak log" behaviour.
+	 */
+	setvbuf(stdout, NULL, _IONBF, 0);
+#else
 	setvbuf(stdout, NULL, _IOLBF, 0);
+#endif
 
 	/* -n N may precede the workload names. */
 	i = 1;

@@ -89,7 +89,7 @@ __lock_stat(env, statp, flags)
 	stats->st_txntimeout = region->tx_timeout;
 	stats->st_id = region->lock_id;
 	stats->st_cur_maxid = region->cur_maxid;
-	stats->st_nlockers = region->nlockers;
+	stats->st_nlockers = __lock_nlockers(region);
 	stats->st_nmodes = region->nmodes;
 
 	for (i = 0; i < region->object_t_size; i++) {
@@ -165,8 +165,26 @@ __lock_stat(env, statp, flags)
 	    &stats->st_region_wait, &stats->st_region_nowait);
 	__mutex_set_wait_info(env, region->mtx_dd,
 	    &stats->st_objs_wait, &stats->st_objs_nowait);
-	__mutex_set_wait_info(env, region->mtx_locker_stripe[0],
-	    &stats->st_lockers_wait, &stats->st_lockers_nowait);
+	/*
+	 * RFC 0015 S7: st_lockers_* is the SUM over all LOCK_LOCKER_STRIPES
+	 * stripe latches.  After P12 it read stripe 0 alone, which is one
+	 * stripe of 64 plus the __lock_id counter, so it understated locker
+	 * contention by up to 64x and every P12 measurement inherited that.
+	 */
+	stats->st_lockers_wait = stats->st_lockers_nowait = 0;
+	for (i = 0; i < LOCK_LOCKER_STRIPES; i++) {
+		__mutex_set_wait_info(env, region->mtx_locker_stripe[i],
+		    &tmp_wait, &tmp_nowait);
+		stats->st_lockers_wait += tmp_wait;
+		stats->st_lockers_nowait += tmp_nowait;
+	}
+	/*
+	 * st_maxnlockers is the sum of the per-stripe watermarks (P12 made the
+	 * counter per-stripe).  Computed here rather than tracked in
+	 * region->stat: the create path must not touch region-wide state, which
+	 * is the whole point of the sharding.
+	 */
+	stats->st_maxnlockers = __lock_maxnlockers(region);
 	stats->st_regsize = lt->reginfo.rp->size;
 	if (LF_ISSET(DB_STAT_CLEAR)) {
 		tmp = region->stat;
@@ -186,7 +204,16 @@ __lock_stat(env, statp, flags)
 		region->stat.st_maxobjects = tmp.st_maxobjects;
 		region->stat.st_nlocks =
 		    region->stat.st_maxnlocks = tmp.st_nlocks;
-		region->stat.st_maxnlockers = region->nlockers;
+		/*
+		 * DB_STAT_CLEAR resets each stripe's locker watermark to its
+		 * CURRENT in-use count, which is what the single region-wide
+		 * counter did (st_maxnlockers = nlockers): clearing a watermark
+		 * means "forget the peak, keep the level".  Done per stripe
+		 * because that is where both numbers now live.
+		 */
+		for (i = 0; i < LOCK_LOCKER_STRIPES; i++)
+			region->locker_stripe[i].maxnlockers =
+			    region->locker_stripe[i].nlockers;
 		region->stat.st_nobjects =
 		    region->stat.st_maxnobjects = tmp.st_nobjects;
 		region->stat.st_partitions = tmp.st_partitions;
@@ -273,6 +300,7 @@ __lock_print_stats(env, flags)
 {
 	DB_LOCK_STAT *sp;
 	int ret;
+	char tagbuf[80];
 
 #ifdef LOCK_DIAGNOSTIC
 	DB_LOCKTAB *lt;
@@ -416,11 +444,14 @@ __lock_print_stats(env, flags)
 	__db_dl_pct(env,
 	    "The number of locker allocations that required waiting",
 	    (u_long)sp->st_lockers_wait, DB_PCT(sp->st_lockers_wait,
-	    sp->st_lockers_wait + sp->st_lockers_nowait), NULL);
+	    sp->st_lockers_wait + sp->st_lockers_nowait),
+	    "summed over all locker stripes");
 	__db_dl_pct(env,
 	    "The number of region locks that required waiting",
 	    (u_long)sp->st_region_wait, DB_PCT(sp->st_region_wait,
-	    sp->st_region_wait + sp->st_region_nowait), NULL);
+	    sp->st_region_wait + sp->st_region_nowait), __env_regenv_tag(env,
+	    ((DB_LOCKREGION *)env->lk_handle->reginfo.primary)->mtx_region,
+	    tagbuf, sizeof(tagbuf)));
 	__db_dl(env, "Maximum hash bucket length",
 	    (u_long)sp->st_hash_len);
 
